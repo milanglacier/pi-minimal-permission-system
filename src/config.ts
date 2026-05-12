@@ -31,11 +31,12 @@ function formatJsoncParseSummary(input: string, errors: readonly JsoncParseError
 }
 
 export function getGlobalConfigPath(): string {
-  return join(homedir(), ".pi", "agent", "minimal-pi-permissions.jsonc");
+  const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  return join(agentDir, "permissions.jsonc");
 }
 
 export function getProjectConfigPath(cwd: string): string {
-  return join(cwd, ".pi", "agent", "pi-permissions.jsonc");
+  return join(cwd, ".pi", "agent", "permissions.jsonc");
 }
 
 function normalizeToolPermissions(value: unknown): ToolPermissions {

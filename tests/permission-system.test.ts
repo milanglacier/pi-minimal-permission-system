@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import minimalPermissionExtension from "../index.js";
-import { parsePermissionConfig, resolvePermissionRules } from "../src/config.js";
+import { getGlobalConfigPath, parsePermissionConfig, resolvePermissionRules } from "../src/config.js";
 import { createPathMatchCandidates } from "../src/common.js";
 import { compileRules, findLastGlobalMatch, findLastMatch } from "../src/matcher.js";
 import type { PermissionRule } from "../src/types.js";
@@ -36,11 +36,11 @@ function writeJsonc(path: string, content: string): void {
 }
 
 function getHomeConfigPath(home: string): string {
-  return join(home, ".pi", "agent", "minimal-pi-permissions.jsonc");
+  return join(home, ".pi", "agent", "permissions.jsonc");
 }
 
 function getProjectConfigPath(cwd: string): string {
-  return join(cwd, ".pi", "agent", "pi-permissions.jsonc");
+  return join(cwd, ".pi", "agent", "permissions.jsonc");
 }
 
 function findEffectiveMatch(rules: PermissionRule[], toolName: PermissionRule["toolName"], values: string[]) {
@@ -77,6 +77,7 @@ function createHarness(globalConfig: string | null, projectConfig: string | null
   const warnings: string[] = [];
   const handlers: Record<string, MockHandler> = {};
   const originalHome = process.env.HOME;
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 
   mkdirSync(home, { recursive: true });
   mkdirSync(cwd, { recursive: true });
@@ -90,6 +91,7 @@ function createHarness(globalConfig: string | null, projectConfig: string | null
   }
 
   process.env.HOME = home;
+  delete process.env.PI_CODING_AGENT_DIR;
 
   minimalPermissionExtension({
     on(name: string, handler: MockHandler): void {
@@ -110,6 +112,11 @@ function createHarness(globalConfig: string | null, projectConfig: string | null
         delete process.env.HOME;
       } else {
         process.env.HOME = originalHome;
+      }
+      if (originalAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = originalAgentDir;
       }
       rmSync(baseDir, { recursive: true, force: true });
     },
@@ -161,9 +168,51 @@ await runTest("JSONC config parses supported tools and ignores unknown states", 
   assert.equal("mcp" in config, false);
 });
 
+await runTest("global config path defaults to permissions.jsonc in the Pi agent directory", () => {
+  withTempDir((dir) => {
+    const originalHome = process.env.HOME;
+    const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    try {
+      process.env.HOME = dir;
+      delete process.env.PI_CODING_AGENT_DIR;
+
+      assert.equal(getGlobalConfigPath(), join(dir, ".pi", "agent", "permissions.jsonc"));
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = originalHome;
+      }
+      if (originalAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+      }
+    }
+  });
+});
+
+await runTest("PI_CODING_AGENT_DIR replaces the default Pi agent directory", () => {
+  withTempDir((dir) => {
+    const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    try {
+      const agentDir = join(dir, "custom-agent-dir");
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+
+      assert.equal(getGlobalConfigPath(), join(agentDir, "permissions.jsonc"));
+    } finally {
+      if (originalAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+      }
+    }
+  });
+});
+
 await runTest("bash rules use last declared match", () => {
   withTempDir((dir) => {
-    const globalPath = join(dir, "minimal-pi-permissions.jsonc");
+    const globalPath = join(dir, "permissions.jsonc");
     writeJsonc(globalPath, `{
       "bash": {
         "*": "allow",
