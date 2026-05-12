@@ -1,9 +1,34 @@
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { parse as parseJsonc } from "jsonc-parser";
+
+import { type ParseError as JsoncParseError, parse as parseJsonc, printParseErrorCode } from "jsonc-parser";
+
 import { isPermissionState, toRecord } from "./common.js";
-import type { PermissionConfig, ToolPermissions } from "./types.js";
+import type { PermissionConfig, PermissionRule, SupportedToolName, ToolPermissions } from "./types.js";
+
+const SUPPORTED_TOOLS = ["bash", "read", "edit", "write"] as const satisfies readonly SupportedToolName[];
+
+export interface CachedPolicy {
+  rules: PermissionRule[];
+  stamp: string;
+}
+
+function isNodeErrorWithCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+function formatJsoncParseSummary(input: string, errors: readonly JsoncParseError[]): string {
+  const firstError = errors[0];
+  if (!firstError) {
+    return "unknown parse error";
+  }
+
+  const beforeOffset = input.slice(0, firstError.offset).split("\n");
+  const line = beforeOffset.length;
+  const column = (beforeOffset.at(-1)?.length ?? 0) + 1;
+  return `${printParseErrorCode(firstError.error)} at line ${line}, column ${column}`;
+}
 
 export function getGlobalConfigPath(): string {
   return join(homedir(), ".pi", "agent", "minimal-pi-permissions.jsonc");
@@ -15,54 +40,92 @@ export function getProjectConfigPath(cwd: string): string {
 
 function normalizeToolPermissions(value: unknown): ToolPermissions {
   const record = toRecord(value);
-  const result: ToolPermissions = {};
-  for (const [key, state] of Object.entries(record)) {
+  const normalized: ToolPermissions = {};
+
+  for (const [pattern, state] of Object.entries(record)) {
     if (isPermissionState(state)) {
-      result[key] = state;
+      normalized[pattern] = state;
     }
   }
-  return result;
+
+  return normalized;
 }
 
-function parseConfig(raw: string, filePath: string): PermissionConfig {
-  const errors: unknown[] = [];
+export function parsePermissionConfig(raw: string, filePath: string): PermissionConfig {
+  const errors: JsoncParseError[] = [];
   const parsed = parseJsonc(raw, errors, { allowTrailingComma: true });
+
   if (errors.length > 0) {
-    throw new Error(`Failed to parse ${filePath}`);
+    throw new Error(`Failed to parse permission config at '${filePath}' (${formatJsoncParseSummary(raw, errors)})`);
   }
+
   const record = toRecord(parsed);
-  return {
-    bash: record.bash !== undefined ? normalizeToolPermissions(record.bash) : undefined,
-    read: record.read !== undefined ? normalizeToolPermissions(record.read) : undefined,
-    write: record.write !== undefined ? normalizeToolPermissions(record.write) : undefined,
-    edit: record.edit !== undefined ? normalizeToolPermissions(record.edit) : undefined,
-  };
+  const config: PermissionConfig = {};
+
+  for (const toolName of SUPPORTED_TOOLS) {
+    if (record[toolName] !== undefined) {
+      config[toolName] = normalizeToolPermissions(record[toolName]);
+    }
+  }
+
+  return config;
 }
 
-export function loadConfig(path: string | null, onWarning?: (msg: string) => void): PermissionConfig | null {
-  if (!path) return null;
+export function loadPermissionConfig(
+  path: string | null,
+  onWarning?: (message: string) => void,
+): PermissionConfig | null {
+  if (!path) {
+    return null;
+  }
+
   try {
-    const raw = readFileSync(path, "utf-8");
-    return parseConfig(raw, path);
+    return parsePermissionConfig(readFileSync(path, "utf-8"), path);
   } catch (error) {
-    if (error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "ENOENT") {
+    if (isNodeErrorWithCode(error, "ENOENT")) {
       return null;
     }
-    const msg = error instanceof Error ? error.message : String(error);
-    onWarning?.(`Failed to load permission config from ${path}: ${msg}`);
+
+    const message = error instanceof Error ? error.message : String(error);
+    onWarning?.(`Failed to load permission config from '${path}': ${message}`);
     return null;
   }
 }
 
-export function mergeConfigs(global: PermissionConfig | null, project: PermissionConfig | null): PermissionConfig {
-  const result: PermissionConfig = {};
-  const tools: (keyof PermissionConfig)[] = ["bash", "read", "write", "edit"];
-  for (const tool of tools) {
-    const globalRules = global?.[tool] ?? {};
-    const projectRules = project?.[tool] ?? {};
-    result[tool] = { ...globalRules, ...projectRules };
+function pushRules(
+  rules: PermissionRule[],
+  layer: PermissionRule["layer"],
+  config: PermissionConfig | null,
+): void {
+  if (!config) {
+    return;
   }
-  return result;
+
+  for (const toolName of SUPPORTED_TOOLS) {
+    const toolRules = config[toolName];
+    if (!toolRules) {
+      continue;
+    }
+
+    for (const [pattern, state] of Object.entries(toolRules)) {
+      rules.push({ toolName, pattern, state, layer });
+    }
+  }
+}
+
+export function resolvePermissionRules(
+  globalPath: string,
+  projectPath: string | null,
+  onWarning?: (message: string) => void,
+): PermissionRule[] {
+  const globalConfig = loadPermissionConfig(globalPath, onWarning);
+  const projectConfig = projectPath ? loadPermissionConfig(projectPath, onWarning) : null;
+  const rules: PermissionRule[] = [];
+
+  pushRules(rules, "global", globalConfig);
+  pushRules(rules, "project", projectConfig);
+
+  return rules;
 }
 
 function getFileStamp(path: string): string {
@@ -73,23 +136,17 @@ function getFileStamp(path: string): string {
   }
 }
 
-export interface CachedConfig {
-  config: PermissionConfig;
-  stamp: string;
+export function buildPolicyStamp(globalPath: string, projectPath: string | null): string {
+  return `${globalPath}:${getFileStamp(globalPath)}|${projectPath ?? "none"}:${projectPath ? getFileStamp(projectPath) : "none"}`;
 }
 
-export function buildStamp(globalPath: string, projectPath: string | null): string {
-  return `${getFileStamp(globalPath)}|${projectPath ? getFileStamp(projectPath) : "none"}`;
-}
-
-export function resolveConfig(
+export function resolveCachedPolicy(
   globalPath: string,
   projectPath: string | null,
-  onWarning?: (msg: string) => void,
-): CachedConfig {
-  const globalConfig = loadConfig(globalPath, onWarning);
-  const projectConfig = projectPath ? loadConfig(projectPath, onWarning) : null;
-  const merged = mergeConfigs(globalConfig, projectConfig);
-  const stamp = buildStamp(globalPath, projectPath);
-  return { config: merged, stamp };
+  onWarning?: (message: string) => void,
+): CachedPolicy {
+  return {
+    rules: resolvePermissionRules(globalPath, projectPath, onWarning),
+    stamp: buildPolicyStamp(globalPath, projectPath),
+  };
 }

@@ -1,32 +1,64 @@
 import picomatch from "picomatch";
-import type { PermissionState } from "./types.js";
 
-export interface CompiledPattern {
-  pattern: string;
+import type { PermissionRule, PermissionState } from "./types.js";
+
+export interface CompiledRule extends PermissionRule {
+  test(value: string): boolean;
+}
+
+export interface RuleMatch {
   state: PermissionState;
-  test: (value: string) => boolean;
+  matchedPattern: string;
+  matchedLayer: PermissionRule["layer"];
 }
 
-export function compilePatterns(patterns: Record<string, PermissionState>): CompiledPattern[] {
-  const entries: CompiledPattern[] = [];
-  for (const [pattern, state] of Object.entries(patterns)) {
-    entries.push({
-      pattern,
-      state,
-      test: picomatch(pattern, { dot: true }),
-    });
-  }
-  return entries;
+export function compileRules(rules: readonly PermissionRule[]): CompiledRule[] {
+  return rules.map((rule) => ({
+    ...rule,
+    test: picomatch(rule.pattern, { dot: true }),
+  }));
 }
 
-export function findMatch(
-  patterns: CompiledPattern[],
-  value: string,
-): { state: PermissionState; matchedPattern: string } | null {
-  for (let i = patterns.length - 1; i >= 0; i--) {
-    if (patterns[i].test(value)) {
-      return { state: patterns[i].state, matchedPattern: patterns[i].pattern };
+export function findLastMatch(
+  rules: readonly CompiledRule[],
+  values: readonly string[],
+): RuleMatch | null {
+  for (let index = rules.length - 1; index >= 0; index -= 1) {
+    const rule = rules[index];
+    for (const value of values) {
+      if (value && rule.test(value)) {
+        return {
+          state: rule.state,
+          matchedPattern: rule.pattern,
+          matchedLayer: rule.layer,
+        };
+      }
     }
   }
+
+  return null;
+}
+
+export function findLastGlobalMatch(
+  rules: readonly CompiledRule[],
+  values: readonly string[],
+): RuleMatch | null {
+  for (let index = rules.length - 1; index >= 0; index -= 1) {
+    const rule = rules[index];
+    if (rule.layer !== "global") {
+      continue;
+    }
+
+    for (const value of values) {
+      if (value && rule.test(value)) {
+        return {
+          state: rule.state,
+          matchedPattern: rule.pattern,
+          matchedLayer: rule.layer,
+        };
+      }
+    }
+  }
+
   return null;
 }

@@ -1,0 +1,306 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+import minimalPermissionExtension from "../index.js";
+import { parsePermissionConfig, resolvePermissionRules } from "../src/config.js";
+import { createPathMatchCandidates } from "../src/common.js";
+import { compileRules, findLastGlobalMatch, findLastMatch } from "../src/matcher.js";
+import type { PermissionRule } from "../src/types.js";
+
+type TestFn = () => void | Promise<void>;
+
+async function runTest(name: string, fn: TestFn): Promise<void> {
+  try {
+    await fn();
+    console.log(`ok - ${name}`);
+  } catch (error) {
+    console.error(`not ok - ${name}`);
+    throw error;
+  }
+}
+
+function withTempDir<T>(operation: (dir: string) => T): T {
+  const dir = mkdtempSync(join(tmpdir(), "pi-minimal-permission-system-"));
+  try {
+    return operation(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function writeJsonc(path: string, content: string): void {
+  mkdirSync(resolve(path, ".."), { recursive: true });
+  writeFileSync(path, content, "utf8");
+}
+
+function getHomeConfigPath(home: string): string {
+  return join(home, ".pi", "agent", "minimal-pi-permissions.jsonc");
+}
+
+function getProjectConfigPath(cwd: string): string {
+  return join(cwd, ".pi", "agent", "pi-permissions.jsonc");
+}
+
+function findEffectiveMatch(rules: PermissionRule[], toolName: PermissionRule["toolName"], values: string[]) {
+  const compiled = compileRules(rules.filter((rule) => rule.toolName === toolName));
+  const match = findLastMatch(compiled, values);
+  if (match?.state !== "deny") {
+    const globalMatch = findLastGlobalMatch(compiled, values);
+    if (globalMatch?.state === "deny") {
+      return globalMatch;
+    }
+  }
+  return match;
+}
+
+type MockHandler = (
+  event: Record<string, unknown>,
+  ctx: Record<string, unknown>,
+) => Promise<Record<string, unknown> | void> | Record<string, unknown> | void;
+
+type Harness = {
+  home: string;
+  cwd: string;
+  handler: MockHandler;
+  prompts: string[];
+  warnings: string[];
+  cleanup(): void;
+};
+
+function createHarness(globalConfig: string | null, projectConfig: string | null): Harness {
+  const baseDir = mkdtempSync(join(tmpdir(), "pi-minimal-permission-system-runtime-"));
+  const home = join(baseDir, "home");
+  const cwd = join(baseDir, "project");
+  const prompts: string[] = [];
+  const warnings: string[] = [];
+  const handlers: Record<string, MockHandler> = {};
+  const originalHome = process.env.HOME;
+
+  mkdirSync(home, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+
+  if (globalConfig !== null) {
+    writeJsonc(getHomeConfigPath(home), globalConfig);
+  }
+
+  if (projectConfig !== null) {
+    writeJsonc(getProjectConfigPath(cwd), projectConfig);
+  }
+
+  process.env.HOME = home;
+
+  minimalPermissionExtension({
+    on(name: string, handler: MockHandler): void {
+      handlers[name] = handler;
+    },
+  } as never);
+
+  assert.equal(typeof handlers.tool_call, "function");
+
+  return {
+    home,
+    cwd,
+    handler: handlers.tool_call,
+    prompts,
+    warnings,
+    cleanup(): void {
+      if (originalHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = originalHome;
+      }
+      rmSync(baseDir, { recursive: true, force: true });
+    },
+  };
+}
+
+function createMockContext(
+  cwd: string,
+  prompts: string[],
+  warnings: string[],
+  options: { hasUI?: boolean; confirmResult?: boolean } = {},
+): Record<string, unknown> {
+  return {
+    cwd,
+    hasUI: options.hasUI === true,
+    ui: {
+      notify(message: string, level: string): void {
+        warnings.push(`${level}: ${message}`);
+      },
+      async confirm(_title: string, message: string): Promise<boolean> {
+        prompts.push(message);
+        return options.confirmResult ?? true;
+      },
+    },
+  };
+}
+
+async function runToolCall(
+  harness: Harness,
+  event: Record<string, unknown>,
+  options: { hasUI?: boolean; confirmResult?: boolean } = {},
+): Promise<Record<string, unknown>> {
+  const result = await Promise.resolve(
+    harness.handler(event, createMockContext(harness.cwd, harness.prompts, harness.warnings, options)),
+  );
+  return (result ?? {}) as Record<string, unknown>;
+}
+
+await runTest("JSONC config parses supported tools and ignores unknown states", () => {
+  const config = parsePermissionConfig(`{
+    // comment
+    "bash": { "*": "ask", "git status": "allow", "bad": "sometimes" },
+    "read": { "**/creds/*": "deny" },
+    "mcp": { "*": "allow" }
+  }`, "inline.jsonc");
+
+  assert.deepEqual(config.bash, { "*": "ask", "git status": "allow" });
+  assert.deepEqual(config.read, { "**/creds/*": "deny" });
+  assert.equal("mcp" in config, false);
+});
+
+await runTest("bash rules use last declared match", () => {
+  withTempDir((dir) => {
+    const globalPath = join(dir, "minimal-pi-permissions.jsonc");
+    writeJsonc(globalPath, `{
+      "bash": {
+        "*": "allow",
+        "git *": "ask",
+        "git status": "allow",
+        "rm -rf *": "deny"
+      }
+    }`);
+
+    const rules = resolvePermissionRules(globalPath, null);
+
+    assert.equal(findEffectiveMatch(rules, "bash", ["git log"])?.state, "ask");
+    assert.equal(findEffectiveMatch(rules, "bash", ["git status"])?.state, "allow");
+    assert.equal(findEffectiveMatch(rules, "bash", ["rm -rf build"])?.state, "deny");
+  });
+});
+
+await runTest("project rules cannot relax global deny", () => {
+  withTempDir((dir) => {
+    const globalPath = join(dir, "global.jsonc");
+    const projectPath = join(dir, "project.jsonc");
+    writeJsonc(globalPath, `{"bash": {"rm -rf *": "deny"}}`);
+    writeJsonc(projectPath, `{"bash": {"rm -rf build": "allow"}}`);
+
+    const rules = resolvePermissionRules(globalPath, projectPath);
+    const match = findEffectiveMatch(rules, "bash", ["rm -rf build"]);
+
+    assert.equal(match?.state, "deny");
+    assert.equal(match?.matchedPattern, "rm -rf *");
+  });
+});
+
+await runTest("global allow can override earlier global deny before project rules", () => {
+  withTempDir((dir) => {
+    const globalPath = join(dir, "global.jsonc");
+    const projectPath = join(dir, "project.jsonc");
+    writeJsonc(globalPath, `{
+      "bash": {
+        "git *": "deny",
+        "git status": "allow"
+      }
+    }`);
+    writeJsonc(projectPath, `{"bash": {"git status": "allow"}}`);
+
+    const rules = resolvePermissionRules(globalPath, projectPath);
+    const match = findEffectiveMatch(rules, "bash", ["git status"]);
+
+    assert.equal(match?.state, "allow");
+    assert.equal(match?.matchedPattern, "git status");
+  });
+});
+
+await runTest("file globs match cwd paths, external paths, dotfiles, and basenames", () => {
+  const cwd = "/workspace/project";
+  const rules: PermissionRule[] = [
+    { toolName: "read", pattern: "**/creds/*", state: "deny", layer: "global" },
+    { toolName: "read", pattern: ".env", state: "ask", layer: "global" },
+  ];
+
+  assert.equal(
+    findEffectiveMatch(rules, "read", createPathMatchCandidates("/tmp/creds/token", cwd))?.state,
+    "deny",
+  );
+  assert.equal(
+    findEffectiveMatch(rules, "read", createPathMatchCandidates("services/creds/token", cwd))?.state,
+    "deny",
+  );
+  assert.equal(
+    findEffectiveMatch(rules, "read", createPathMatchCandidates("/workspace/project/.env", cwd))?.state,
+    "ask",
+  );
+});
+
+await runTest("tool_call allows supported tool when matching rule is allow", async () => {
+  const harness = createHarness(`{"bash": {"git status": "allow"}}`, null);
+  try {
+    const result = await runToolCall(harness, {
+      toolName: "bash",
+      input: { command: "git status" },
+    });
+
+    assert.deepEqual(result, {});
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("tool_call blocks deny and passes unsupported tools through", async () => {
+  const harness = createHarness(`{"bash": {"rm -rf *": "deny"}}`, null);
+  try {
+    const denied = await runToolCall(harness, {
+      toolName: "bash",
+      input: { command: "rm -rf build" },
+    });
+    const unsupported = await runToolCall(harness, {
+      toolName: "grep",
+      input: { pattern: "needle" },
+    });
+
+    assert.equal(denied.block, true);
+    assert.match(String(denied.reason), /rm -rf build/);
+    assert.match(String(denied.reason), /Hard stop/);
+    assert.deepEqual(unsupported, {});
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("tool_call prompts on ask with UI and blocks when user denies", async () => {
+  const harness = createHarness(`{"read": {".env": "ask"}}`, null);
+  try {
+    const result = await runToolCall(
+      harness,
+      { toolName: "read", input: { path: ".env" } },
+      { hasUI: true, confirmResult: false },
+    );
+
+    assert.equal(result.block, true);
+    assert.match(String(result.reason), /User denied read/);
+    assert.equal(harness.prompts.length, 1);
+    assert.match(harness.prompts[0], /\.env/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("tool_call blocks ask when no UI is available", async () => {
+  const harness = createHarness(`{"write": {"*": "ask"}}`, null);
+  try {
+    const result = await runToolCall(harness, {
+      toolName: "write",
+      input: { path: "notes.txt", content: "hello" },
+    });
+
+    assert.equal(result.block, true);
+    assert.match(String(result.reason), /requires approval, but no interactive UI is available/);
+  } finally {
+    harness.cleanup();
+  }
+});

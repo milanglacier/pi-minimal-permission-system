@@ -1,170 +1,189 @@
-import { homedir } from "node:os";
-import { resolve, normalize, relative } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { getGlobalConfigPath, getProjectConfigPath, resolveConfig, buildStamp } from "./src/config.js";
-import { compilePatterns } from "./src/matcher.js";
-import type { CachedConfig } from "./src/config.js";
-import type { PermissionCheckResult, PermissionConfig, PermissionState } from "./src/types.js";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-const SUPPORTED_TOOLS = new Set(["bash", "read", "write", "edit"]);
+import { createPathMatchCandidates, getNonEmptyString, normalizePathForPermission, toRecord } from "./src/common.js";
+import {
+  buildPolicyStamp,
+  getGlobalConfigPath,
+  getProjectConfigPath,
+  resolveCachedPolicy,
+  type CachedPolicy,
+} from "./src/config.js";
+import { compileRules, findLastGlobalMatch, findLastMatch, type CompiledRule, type RuleMatch } from "./src/matcher.js";
+import type { PermissionCheckResult, SupportedToolName } from "./src/types.js";
 
-function normalizePath(pathValue: string, cwd: string): string {
-  const trimmed = pathValue.trim().replace(/^["']|["']$/g, "");
-  if (!trimmed) return "";
+const SUPPORTED_TOOLS = new Set<string>(["bash", "read", "edit", "write"]);
 
-  let normalizedPath = trimmed;
-  if (normalizedPath === "~") {
-    normalizedPath = homedir();
-  } else if (normalizedPath.startsWith("~/")) {
-    normalizedPath = join(homedir(), normalizedPath.slice(2));
-  }
+type ToolCallEventLike = {
+  toolName?: unknown;
+  name?: unknown;
+  input?: unknown;
+  arguments?: unknown;
+};
 
-  const absolutePath = resolve(cwd, normalizedPath);
-  const normalizedAbsolutePath = normalize(absolutePath);
-  return process.platform === "win32" ? normalizedAbsolutePath.toLowerCase() : normalizedAbsolutePath;
+type RuntimePolicy = CachedPolicy & {
+  compiledRules: CompiledRule[];
+};
+
+let cachedPolicy: RuntimePolicy | null = null;
+let cachedCwd: string | undefined;
+
+function getEventToolName(event: ToolCallEventLike): string | null {
+  return getNonEmptyString(event.toolName) ?? getNonEmptyString(event.name);
 }
 
-function getRelativePath(absolutePath: string, cwd: string): string {
-  const rel = relative(normalize(cwd), absolutePath);
-  return process.platform === "win32" ? normalize(rel).replace(/\\/g, "/") : normalize(rel);
+function getEventInput(event: ToolCallEventLike): unknown {
+  if (event.input !== undefined) {
+    return event.input;
+  }
+
+  if (event.arguments !== undefined) {
+    return event.arguments;
+  }
+
+  return {};
+}
+
+function loadPolicy(ctx: ExtensionContext): RuntimePolicy {
+  const globalPath = getGlobalConfigPath();
+  const projectPath = ctx.cwd ? getProjectConfigPath(ctx.cwd) : null;
+  const stamp = buildPolicyStamp(globalPath, projectPath);
+
+  if (cachedPolicy && cachedCwd === ctx.cwd && cachedPolicy.stamp === stamp) {
+    return cachedPolicy;
+  }
+
+  const warn = (message: string): void => {
+    if (ctx.hasUI) {
+      ctx.ui.notify(message, "warning");
+    }
+  };
+
+  const resolved = resolveCachedPolicy(globalPath, projectPath, warn);
+  cachedPolicy = {
+    ...resolved,
+    compiledRules: compileRules(resolved.rules),
+  };
+  cachedCwd = ctx.cwd;
+  return cachedPolicy;
+}
+
+function resolveRuleMatch(
+  rules: readonly CompiledRule[],
+  toolName: SupportedToolName,
+  values: readonly string[],
+): RuleMatch | null {
+  const toolRules = rules.filter((rule) => rule.toolName === toolName);
+  const match = findLastMatch(toolRules, values);
+
+  if (match?.state !== "deny") {
+    const globalMatch = findLastGlobalMatch(toolRules, values);
+    if (globalMatch?.state === "deny") {
+      return globalMatch;
+    }
+  }
+
+  return match;
 }
 
 function checkPermission(
-  toolName: string,
+  toolName: SupportedToolName,
   input: unknown,
   cwd: string | undefined,
-  config: PermissionConfig,
+  policy: RuntimePolicy,
 ): PermissionCheckResult {
-  const rules = config[toolName as keyof PermissionConfig];
-  if (!rules || Object.keys(rules).length === 0) {
-    return { toolName, state: "ask" };
-  }
-
-  const compiled = compilePatterns(rules);
+  const record = toRecord(input);
 
   if (toolName === "bash") {
-    const command = typeof (input as Record<string, unknown>).command === "string"
-      ? String((input as Record<string, unknown>).command)
-      : "";
-
-    let lastMatch: { state: PermissionState; matchedPattern: string } | null = null;
-    for (let i = compiled.length - 1; i >= 0; i--) {
-      if (compiled[i].test(command)) {
-        lastMatch = { state: compiled[i].state, matchedPattern: compiled[i].pattern };
-        break;
-      }
-    }
+    const command = getNonEmptyString(record.command) ?? "";
+    const match = resolveRuleMatch(policy.compiledRules, toolName, [command]);
 
     return {
       toolName,
-      state: lastMatch?.state ?? "ask",
-      matchedPattern: lastMatch?.matchedPattern,
+      state: match?.state ?? "ask",
+      matchedPattern: match?.matchedPattern,
+      matchedLayer: match?.matchedLayer,
       command,
     };
   }
 
-  // read, write, edit
-  const pathInput = typeof (input as Record<string, unknown>).path === "string"
-    ? String((input as Record<string, unknown>).path)
-    : "";
-
-  const absolutePath = cwd ? normalizePath(pathInput, cwd) : pathInput;
-  const relPath = cwd ? getRelativePath(absolutePath, cwd) : pathInput;
-
-  let lastMatch: { state: PermissionState; matchedPattern: string } | null = null;
-
-  for (let i = compiled.length - 1; i >= 0; i--) {
-    const pattern = compiled[i];
-    if (pattern.test(absolutePath) || pattern.test(relPath)) {
-      lastMatch = { state: pattern.state, matchedPattern: pattern.pattern };
-      break;
-    }
-  }
+  const pathValue = getNonEmptyString(record.path) ?? getNonEmptyString(record.file_path) ?? "";
+  const path = pathValue ? normalizePathForPermission(pathValue, cwd) : "";
+  const candidates = pathValue ? createPathMatchCandidates(pathValue, cwd) : [];
+  const match = resolveRuleMatch(policy.compiledRules, toolName, candidates);
 
   return {
     toolName,
-    state: lastMatch?.state ?? "ask",
-    matchedPattern: lastMatch?.matchedPattern,
-    path: absolutePath,
+    state: match?.state ?? "ask",
+    matchedPattern: match?.matchedPattern,
+    matchedLayer: match?.matchedLayer,
+    path,
   };
+}
+
+function formatMatchSuffix(result: PermissionCheckResult): string {
+  if (!result.matchedPattern) {
+    return "";
+  }
+
+  const layer = result.matchedLayer ? ` from ${result.matchedLayer} config` : "";
+  return ` (matched '${result.matchedPattern}'${layer})`;
+}
+
+function hardStop(): string {
+  return "Hard stop: this permission denial is policy-enforced. Do not retry or investigate bypasses; report the block to the user.";
 }
 
 function formatDenyReason(result: PermissionCheckResult): string {
-  if (result.toolName === "bash" && result.command) {
-    return `Permission denied for bash command '${result.command}'${result.matchedPattern ? ` (matched '${result.matchedPattern}')` : ""}. Hard stop: do not retry or investigate bypasses; report the block to the user.`;
+  if (result.toolName === "bash") {
+    return `Permission denied for bash command '${result.command ?? ""}'${formatMatchSuffix(result)}. ${hardStop()}`;
   }
-  if (result.path) {
-    return `Permission denied for ${result.toolName} on '${result.path}'${result.matchedPattern ? ` (matched '${result.matchedPattern}')` : ""}. Hard stop: do not retry or investigate bypasses; report the block to the user.`;
-  }
-  return `Permission denied for tool '${result.toolName}'. Hard stop: do not retry or investigate bypasses; report the block to the user.`;
+
+  return `Permission denied for ${result.toolName} on '${result.path ?? ""}'${formatMatchSuffix(result)}. ${hardStop()}`;
 }
 
 function formatAskPrompt(result: PermissionCheckResult): string {
-  if (result.toolName === "bash" && result.command) {
-    return `Allow bash command '${result.command}'?`;
+  if (result.toolName === "bash") {
+    return `Allow bash command '${result.command ?? ""}'${formatMatchSuffix(result)}?`;
   }
-  if (result.path) {
-    return `Allow ${result.toolName} on '${result.path}'?`;
-  }
-  return `Allow tool '${result.toolName}'?`;
+
+  return `Allow ${result.toolName} on '${result.path ?? ""}'${formatMatchSuffix(result)}?`;
 }
 
 function formatUnavailableReason(result: PermissionCheckResult): string {
-  if (result.toolName === "bash" && result.command) {
-    return `Bash command '${result.command}' requires approval, but no interactive UI is available.`;
+  if (result.toolName === "bash") {
+    return `Bash command '${result.command ?? ""}' requires approval, but no interactive UI is available.`;
   }
-  if (result.path) {
-    return `${result.toolName} on '${result.path}' requires approval, but no interactive UI is available.`;
-  }
-  return `Tool '${result.toolName}' requires approval, but no interactive UI is available.`;
+
+  return `${result.toolName} on '${result.path ?? ""}' requires approval, but no interactive UI is available.`;
 }
 
 function formatUserDeniedReason(result: PermissionCheckResult): string {
-  if (result.toolName === "bash" && result.command) {
-    return `User denied bash command '${result.command}'. Hard stop: do not retry or investigate bypasses; report the block to the user.`;
+  if (result.toolName === "bash") {
+    return `User denied bash command '${result.command ?? ""}'. ${hardStop()}`;
   }
-  if (result.path) {
-    return `User denied ${result.toolName} on '${result.path}'. Hard stop: do not retry or investigate bypasses; report the block to the user.`;
-  }
-  return `User denied tool '${result.toolName}'. Hard stop: do not retry or investigate bypasses; report the block to the user.`;
+
+  return `User denied ${result.toolName} on '${result.path ?? ""}'. ${hardStop()}`;
 }
 
 export default function minimalPermissionExtension(pi: ExtensionAPI): void {
-  let cached: CachedConfig | null = null;
-  let lastCwd: string | undefined;
-
-  const refreshConfig = (ctx: ExtensionContext, onWarning?: (msg: string) => void): PermissionConfig => {
-    const globalPath = getGlobalConfigPath();
-    const projectPath = ctx.cwd ? getProjectConfigPath(ctx.cwd) : null;
-    const stamp = buildStamp(globalPath, projectPath);
-
-    if (cached && lastCwd === ctx.cwd && cached.stamp === stamp) {
-      return cached.config;
-    }
-
-    const resolved = resolveConfig(globalPath, projectPath, onWarning);
-    cached = resolved;
-    lastCwd = ctx.cwd;
-    return resolved.config;
-  };
-
   pi.on("session_start", async (_event, ctx) => {
-    refreshConfig(ctx, (msg) => {
-      if (ctx.hasUI) ctx.ui.notify(msg, "warning");
-    });
+    loadPolicy(ctx);
   });
 
-  pi.on("tool_call", async (event, ctx) => {
-    const toolName = event.toolName;
-    if (!SUPPORTED_TOOLS.has(toolName)) {
+  pi.on("tool_call", async (event: unknown, ctx) => {
+    const toolEvent = toRecord(event) as ToolCallEventLike;
+    const toolName = getEventToolName(toolEvent);
+    if (!toolName || !SUPPORTED_TOOLS.has(toolName)) {
       return {};
     }
 
-    const config = refreshConfig(ctx, (msg) => {
-      if (ctx.hasUI) ctx.ui.notify(msg, "warning");
-    });
-
-    const result = checkPermission(toolName, event.input, ctx.cwd, config);
+    const policy = loadPolicy(ctx);
+    const result = checkPermission(
+      toolName as SupportedToolName,
+      getEventInput(toolEvent),
+      ctx.cwd,
+      policy,
+    );
 
     if (result.state === "deny") {
       return { block: true, reason: formatDenyReason(result) };
@@ -175,9 +194,8 @@ export default function minimalPermissionExtension(pi: ExtensionAPI): void {
         return { block: true, reason: formatUnavailableReason(result) };
       }
 
-      const message = formatAskPrompt(result);
-      const ok = await ctx.ui.confirm("Permission Required", message);
-      if (!ok) {
+      const approved = await ctx.ui.confirm("Permission Required", formatAskPrompt(result));
+      if (!approved) {
         return { block: true, reason: formatUserDeniedReason(result) };
       }
     }

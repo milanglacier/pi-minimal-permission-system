@@ -7,6 +7,23 @@
   "exports": {
     ".": "./index.ts"
   },
+  "files": [
+    "index.ts",
+    "src",
+    "tests",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx ./tests/permission-system.test.ts",
+    "check": "npm run typecheck && npm run test"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "permissions"
+  ],
   "pi": {
     "extensions": [
       "./index.ts"
@@ -18,5 +35,10 @@
   "dependencies": {
     "jsonc-parser": "^3.3.1",
     "picomatch": "^4.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
   }
 }
