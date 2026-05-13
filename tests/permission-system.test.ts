@@ -124,9 +124,7 @@ async function createHarness(
 
   assert.equal(typeof eventHandlers.tool_call, "function");
   assert.equal(typeof eventHandlers.session_start, "function");
-  await Promise.resolve(
-    eventHandlers.session_start({ type: "session_start", reason: "startup" }, createMockContext(cwd, prompts, warnings)),
-  );
+  await eventHandlers.session_start({ type: "session_start", reason: "startup" }, createMockContext(cwd, prompts, warnings));
 
   return {
     home,
@@ -177,8 +175,9 @@ async function runToolCall(
   event: Record<string, unknown>,
   options: { hasUI?: boolean; confirmResult?: boolean } = {},
 ): Promise<Record<string, unknown>> {
-  const result = await Promise.resolve(
-    harness.toolCallHandler(event, createMockContext(harness.cwd, harness.prompts, harness.warnings, options)),
+  const result = await harness.toolCallHandler(
+    event,
+    createMockContext(harness.cwd, harness.prompts, harness.warnings, options),
   );
   return (result ?? {}) as Record<string, unknown>;
 }
@@ -186,9 +185,7 @@ async function runToolCall(
 async function runSlashCommand(harness: Harness, name: string, args = ""): Promise<void> {
   const slashCommand = harness.slashCommands[name];
   assert.equal(typeof slashCommand, "function");
-  await Promise.resolve(
-    slashCommand(args, createMockContext(harness.cwd, harness.prompts, harness.warnings, { hasUI: true })),
-  );
+  await slashCommand(args, createMockContext(harness.cwd, harness.prompts, harness.warnings, { hasUI: true }));
 }
 
 await runTest("JSONC config parses supported tools and ignores unknown states", () => {
