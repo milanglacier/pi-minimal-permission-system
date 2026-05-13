@@ -72,11 +72,11 @@ type Harness = {
   cleanup(): void;
 };
 
-function createHarness(
+async function createHarness(
   globalConfig: string | null,
   projectConfig: string | null,
   options: { yoloFlag?: boolean } = {},
-): Harness {
+): Promise<Harness> {
   const baseDir = mkdtempSync(join(tmpdir(), "pi-minimal-permission-system-runtime-"));
   const home = join(baseDir, "home");
   const cwd = join(baseDir, "project");
@@ -124,7 +124,9 @@ function createHarness(
 
   assert.equal(typeof eventHandlers.tool_call, "function");
   assert.equal(typeof eventHandlers.session_start, "function");
-  void eventHandlers.session_start({ type: "session_start", reason: "startup" }, createMockContext(cwd, prompts, warnings));
+  await Promise.resolve(
+    eventHandlers.session_start({ type: "session_start", reason: "startup" }, createMockContext(cwd, prompts, warnings)),
+  );
 
   return {
     home,
@@ -348,7 +350,7 @@ await runTest("file globs match cwd paths, external paths, dotfiles, and basenam
 });
 
 await runTest("tool_call allows supported tool when matching rule is allow", async () => {
-  const harness = createHarness(`{"bash": {"git status": "allow"}}`, null);
+  const harness = await createHarness(`{"bash": {"git status": "allow"}}`, null);
   try {
     const result = await runToolCall(harness, {
       toolName: "bash",
@@ -362,7 +364,7 @@ await runTest("tool_call allows supported tool when matching rule is allow", asy
 });
 
 await runTest("tool_call blocks deny and passes unsupported tools through", async () => {
-  const harness = createHarness(`{"bash": {"rm -rf .*": "deny"}}`, null);
+  const harness = await createHarness(`{"bash": {"rm -rf .*": "deny"}}`, null);
   try {
     const denied = await runToolCall(harness, {
       toolName: "bash",
@@ -383,7 +385,7 @@ await runTest("tool_call blocks deny and passes unsupported tools through", asyn
 });
 
 await runTest("tool_call prompts on ask with UI and blocks when user denies", async () => {
-  const harness = createHarness(`{"read": {".env": "ask"}}`, null);
+  const harness = await createHarness(`{"read": {".env": "ask"}}`, null);
   try {
     const result = await runToolCall(
       harness,
@@ -401,7 +403,7 @@ await runTest("tool_call prompts on ask with UI and blocks when user denies", as
 });
 
 await runTest("tool_call blocks ask when no UI is available", async () => {
-  const harness = createHarness(`{"write": {"*": "ask"}}`, null);
+  const harness = await createHarness(`{"write": {"*": "ask"}}`, null);
   try {
     const result = await runToolCall(harness, {
       toolName: "write",
@@ -416,7 +418,7 @@ await runTest("tool_call blocks ask when no UI is available", async () => {
 });
 
 await runTest("--yolo bypasses permission checks including global deny rules", async () => {
-  const harness = createHarness(`{"bash": {"rm -rf .*": "deny"}}`, null, { yoloFlag: true });
+  const harness = await createHarness(`{"bash": {"rm -rf .*": "deny"}}`, null, { yoloFlag: true });
   try {
     const result = await runToolCall(harness, {
       toolName: "bash",
@@ -430,7 +432,7 @@ await runTest("--yolo bypasses permission checks including global deny rules", a
 });
 
 await runTest("/yolo toggles permission checks for the current session", async () => {
-  const harness = createHarness(`{"bash": {"rm -rf .*": "deny"}}`, null);
+  const harness = await createHarness(`{"bash": {"rm -rf .*": "deny"}}`, null);
   try {
     const deniedBeforeToggle = await runToolCall(harness, {
       toolName: "bash",
