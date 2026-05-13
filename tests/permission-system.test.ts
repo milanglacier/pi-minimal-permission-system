@@ -158,12 +158,12 @@ async function runToolCall(
 await runTest("JSONC config parses supported tools and ignores unknown states", () => {
   const config = parsePermissionConfig(`{
     // comment
-    "bash": { "*": "ask", "git status": "allow", "bad": "sometimes" },
+    "bash": { ".*": "ask", "git status": "allow", "bad": "sometimes" },
     "read": { "**/creds/*": "deny" },
     "mcp": { "*": "allow" }
   }`, "inline.jsonc");
 
-  assert.deepEqual(config.bash, { "*": "ask", "git status": "allow" });
+  assert.deepEqual(config.bash, { ".*": "ask", "git status": "allow" });
   assert.deepEqual(config.read, { "**/creds/*": "deny" });
   assert.equal("mcp" in config, false);
 });
@@ -215,10 +215,10 @@ await runTest("bash rules use last declared match", () => {
     const globalPath = join(dir, "permissions.jsonc");
     writeJsonc(globalPath, `{
       "bash": {
-        "*": "allow",
-        "git *": "ask",
+        ".*": "allow",
+        "git .*": "ask",
         "git status": "allow",
-        "rm -rf *": "deny"
+        "rm -rf .*": "deny"
       }
     }`);
 
@@ -234,14 +234,14 @@ await runTest("project rules cannot relax global deny", () => {
   withTempDir((dir) => {
     const globalPath = join(dir, "global.jsonc");
     const projectPath = join(dir, "project.jsonc");
-    writeJsonc(globalPath, `{"bash": {"rm -rf *": "deny"}}`);
+    writeJsonc(globalPath, `{"bash": {"rm -rf .*": "deny"}}`);
     writeJsonc(projectPath, `{"bash": {"rm -rf build": "allow"}}`);
 
     const rules = resolvePermissionRules(globalPath, projectPath);
     const match = findEffectiveMatch(rules, "bash", ["rm -rf build"]);
 
     assert.equal(match?.state, "deny");
-    assert.equal(match?.matchedPattern, "rm -rf *");
+    assert.equal(match?.matchedPattern, "rm -rf .*");
   });
 });
 
@@ -251,7 +251,7 @@ await runTest("global allow can override earlier global deny before project rule
     const projectPath = join(dir, "project.jsonc");
     writeJsonc(globalPath, `{
       "bash": {
-        "git *": "deny",
+        "git .*": "deny",
         "git status": "allow"
       }
     }`);
@@ -263,6 +263,33 @@ await runTest("global allow can override earlier global deny before project rule
     assert.equal(match?.state, "allow");
     assert.equal(match?.matchedPattern, "git status");
   });
+});
+
+await runTest("bash regex rules match command substrings including slashes", () => {
+  const rules: PermissionRule[] = [
+    { toolName: "bash", pattern: ".*", state: "allow", layer: "global" },
+    { toolName: "bash", pattern: "git status", state: "ask", layer: "global" },
+    { toolName: "bash", pattern: "git push", state: "deny", layer: "global" },
+  ];
+
+  assert.equal(
+    findEffectiveMatch(rules, "bash", ['find /home/milanglacier/.pi -name "permissions.jsonc" 2>/dev/null | head -5'])
+      ?.state,
+    "allow",
+  );
+  assert.equal(findEffectiveMatch(rules, "bash", ["echo git status"])?.state, "ask");
+  assert.equal(findEffectiveMatch(rules, "bash", ["git status"])?.state, "ask");
+  assert.equal(findEffectiveMatch(rules, "bash", ["cd xxx && git push origin master"])?.state, "deny");
+});
+
+await runTest("invalid bash regex rules do not match", () => {
+  const rules: PermissionRule[] = [
+    { toolName: "bash", pattern: "*", state: "allow", layer: "global" },
+    { toolName: "bash", pattern: "git status", state: "ask", layer: "global" },
+  ];
+
+  assert.equal(findEffectiveMatch(rules, "bash", ["find /tmp -name file"])?.state, undefined);
+  assert.equal(findEffectiveMatch(rules, "bash", ["git status"])?.state, "ask");
 });
 
 await runTest("file globs match cwd paths, external paths, dotfiles, and basenames", () => {
@@ -301,7 +328,7 @@ await runTest("tool_call allows supported tool when matching rule is allow", asy
 });
 
 await runTest("tool_call blocks deny and passes unsupported tools through", async () => {
-  const harness = createHarness(`{"bash": {"rm -rf *": "deny"}}`, null);
+  const harness = createHarness(`{"bash": {"rm -rf .*": "deny"}}`, null);
   try {
     const denied = await runToolCall(harness, {
       toolName: "bash",

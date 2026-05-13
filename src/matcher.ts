@@ -15,8 +15,17 @@ export interface RuleMatch {
 export function compileRules(rules: readonly PermissionRule[]): CompiledRule[] {
   return rules.map((rule) => ({
     ...rule,
-    test: picomatch(rule.pattern, { dot: true }),
+    test: rule.toolName === "bash" ? compileBashRegex(rule.pattern) : picomatch(rule.pattern, { dot: true }),
   }));
+}
+
+function compileBashRegex(pattern: string): (value: string) => boolean {
+  try {
+    const regex = new RegExp(pattern, "u");
+    return (value: string): boolean => regex.test(value);
+  } catch {
+    return (): boolean => false;
+  }
 }
 
 export function findLastMatch(
