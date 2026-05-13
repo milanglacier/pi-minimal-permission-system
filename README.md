@@ -22,7 +22,19 @@ Pi is designed to be minimal. This extension follows the same approach:
 
 ## Installation
 
-Clone this project to `~/.pi/agent/extensions`:
+Install from npm with Pi:
+
+```bash
+pi install npm:pi-minimal-permission-system
+```
+
+To pin a specific release:
+
+```bash
+pi install npm:pi-minimal-permission-system@1.0.0
+```
+
+For local development, you can still clone it into `~/.pi/agent/extensions`:
 
 ```bash
 cd ~/.pi/agent/extensions

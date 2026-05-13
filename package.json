@@ -7,10 +7,20 @@
   "exports": {
     ".": "./index.ts"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/milanglacier/pi-minimal-permission-system.git"
+  },
+  "homepage": "https://github.com/milanglacier/pi-minimal-permission-system",
+  "bugs": {
+    "url": "https://github.com/milanglacier/pi-minimal-permission-system/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "index.ts",
     "src",
-    "tests",
     "README.md"
   ],
   "scripts": {
@@ -30,7 +40,7 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.72.0"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "dependencies": {
     "jsonc-parser": "^3.3.1",
