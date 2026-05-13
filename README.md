@@ -43,7 +43,6 @@ Applies to **every** Pi session regardless of working directory.
 
 `<cwd>/.pi/agent/permissions.jsonc`
 
-
 Applies only when Pi's working directory is inside that project. Project rules are layered on top of global rules.
 
 ### Format
@@ -163,8 +162,8 @@ Editing `package.json` inside `my-app` will prompt for confirmation; everywhere 
 | **Subagent permissions**        | ❌ Not supported (intentionally)                    | ✅ Supported                                                              |
 | **Filesystem tool granularity** | ✅ `read`, `edit`, `write` controlled independently | ❌ Not currently supported                                                |
 | **Command filtering**           | ✅ Regex-based bash rules                           | ✅ Supported                                                              |
-| **MCP / extension tools**       | ❌ Not supported (intentionally)                    | —                                                                         |
-| **Config format**               | JSONC                                               | JSONC                                                                     |
+| **MCP / extension tools**       | ❌ Not supported (intentionally)                    | ✅ Supported                                                              |
+| **Config format**               | JSONC                                               | JSONC/YAML                                                                |
 
 **When to choose this extension:**
 
