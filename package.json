@@ -1,6 +1,6 @@
 {
   "name": "pi-minimal-permission-system",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Minimal permission enforcement extension for the Pi coding agent.",
   "type": "module",
   "main": "./index.ts",
