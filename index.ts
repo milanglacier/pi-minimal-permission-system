@@ -26,6 +26,7 @@ type RuntimePolicy = CachedPolicy & {
 
 let cachedPolicy: RuntimePolicy | null = null;
 let cachedCwd: string | undefined;
+let yoloEnabled = false;
 
 function getEventToolName(event: ToolCallEventLike): string | null {
   return getNonEmptyString(event.toolName) ?? getNonEmptyString(event.name);
@@ -166,14 +167,37 @@ function formatUserDeniedReason(result: PermissionCheckResult): string {
 }
 
 export default function minimalPermissionExtension(pi: ExtensionAPI): void {
+  yoloEnabled = false;
+
+  pi.registerFlag("yolo", {
+    description: "Bypass permission checks enforced by pi-minimal-permission-system.",
+    type: "boolean",
+    default: false,
+  });
+
+  pi.registerCommand("yolo", {
+    description: "Toggle permission checks enforced by pi-minimal-permission-system.",
+    handler: async (_args, ctx) => {
+      yoloEnabled = !yoloEnabled;
+      ctx.ui.notify(`YOLO mode ${yoloEnabled ? "enabled" : "disabled"}`, "info");
+    },
+  });
+
   pi.on("session_start", async (_event, ctx) => {
-    loadPolicy(ctx);
+    yoloEnabled = pi.getFlag("yolo") === true;
+    if (!yoloEnabled) {
+      loadPolicy(ctx);
+    }
   });
 
   pi.on("tool_call", async (event: unknown, ctx) => {
     const toolEvent = toRecord(event) as ToolCallEventLike;
     const toolName = getEventToolName(toolEvent);
     if (!toolName || !SUPPORTED_TOOLS.has(toolName)) {
+      return {};
+    }
+
+    if (yoloEnabled) {
       return {};
     }
 

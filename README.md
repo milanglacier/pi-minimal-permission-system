@@ -105,6 +105,16 @@ Applies only when Pi's working directory is inside that project. Project rules a
 2. The **last matching rule wins**.
 3. **Global `deny` is special**: if the last match is not a `deny`, the system still checks whether any global rule issues a `deny`. This means you can safely set a global hard boundary (e.g. deny `/etc/**`) that cannot be accidentally overridden by a project-local rule.
 
+### YOLO mode
+
+Start Pi with `--yolo` or run `/yolo` during an interactive session to bypass
+all permission checks enforced by this extension. `/yolo` is a toggle; running
+it again restores normal permission enforcement.
+
+When YOLO mode is enabled, `bash`, `read`, `edit`, and `write` tool calls are
+allowed without loading policy, checking rules, prompting, or honoring global
+`deny` rules.
+
 ## Example workflows
 
 ### Read-only mode for sensitive directories

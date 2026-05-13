@@ -13,6 +13,22 @@ declare module "@earendil-works/pi-coding-agent" {
       eventName: "session_start" | "tool_call" | string,
       handler: (event: unknown, ctx: ExtensionContext) => unknown | Promise<unknown>,
     ): void;
+    registerCommand(
+      name: string,
+      options: {
+        description?: string;
+        handler: (args: string, ctx: ExtensionContext) => void | Promise<void>;
+      },
+    ): void;
+    registerFlag(
+      name: string,
+      options: {
+        description?: string;
+        type: "boolean" | "string";
+        default?: boolean | string;
+      },
+    ): void;
+    getFlag(name: string): boolean | string | undefined;
   }
 }
 

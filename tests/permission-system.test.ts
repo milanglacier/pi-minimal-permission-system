@@ -55,27 +55,36 @@ function findEffectiveMatch(rules: PermissionRule[], toolName: PermissionRule["t
   return match;
 }
 
-type MockHandler = (
+type MockEventHandler = (
   event: Record<string, unknown>,
   ctx: Record<string, unknown>,
 ) => Promise<Record<string, unknown> | void> | Record<string, unknown> | void;
 
+type MockSlashCommandHandler = (args: string, ctx: Record<string, unknown>) => Promise<void> | void;
+
 type Harness = {
   home: string;
   cwd: string;
-  handler: MockHandler;
+  toolCallHandler: MockEventHandler;
+  slashCommands: Record<string, MockSlashCommandHandler>;
   prompts: string[];
   warnings: string[];
   cleanup(): void;
 };
 
-function createHarness(globalConfig: string | null, projectConfig: string | null): Harness {
+function createHarness(
+  globalConfig: string | null,
+  projectConfig: string | null,
+  options: { yoloFlag?: boolean } = {},
+): Harness {
   const baseDir = mkdtempSync(join(tmpdir(), "pi-minimal-permission-system-runtime-"));
   const home = join(baseDir, "home");
   const cwd = join(baseDir, "project");
   const prompts: string[] = [];
   const warnings: string[] = [];
-  const handlers: Record<string, MockHandler> = {};
+  const eventHandlers: Record<string, MockEventHandler> = {};
+  const slashCommands: Record<string, MockSlashCommandHandler> = {};
+  const flagValues = new Map<string, boolean | string>();
   const originalHome = process.env.HOME;
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 
@@ -92,19 +101,36 @@ function createHarness(globalConfig: string | null, projectConfig: string | null
 
   process.env.HOME = home;
   delete process.env.PI_CODING_AGENT_DIR;
+  if (options.yoloFlag === true) {
+    flagValues.set("yolo", true);
+  }
 
   minimalPermissionExtension({
-    on(name: string, handler: MockHandler): void {
-      handlers[name] = handler;
+    on(name: string, handler: MockEventHandler): void {
+      eventHandlers[name] = handler;
+    },
+    registerCommand(name: string, commandOptions: { handler: MockSlashCommandHandler }): void {
+      slashCommands[name] = commandOptions.handler;
+    },
+    registerFlag(name: string, flagOptions: { default?: boolean | string }): void {
+      if (flagOptions.default !== undefined && !flagValues.has(name)) {
+        flagValues.set(name, flagOptions.default);
+      }
+    },
+    getFlag(name: string): boolean | string | undefined {
+      return flagValues.get(name);
     },
   } as never);
 
-  assert.equal(typeof handlers.tool_call, "function");
+  assert.equal(typeof eventHandlers.tool_call, "function");
+  assert.equal(typeof eventHandlers.session_start, "function");
+  void eventHandlers.session_start({ type: "session_start", reason: "startup" }, createMockContext(cwd, prompts, warnings));
 
   return {
     home,
     cwd,
-    handler: handlers.tool_call,
+    toolCallHandler: eventHandlers.tool_call,
+    slashCommands,
     prompts,
     warnings,
     cleanup(): void {
@@ -150,9 +176,17 @@ async function runToolCall(
   options: { hasUI?: boolean; confirmResult?: boolean } = {},
 ): Promise<Record<string, unknown>> {
   const result = await Promise.resolve(
-    harness.handler(event, createMockContext(harness.cwd, harness.prompts, harness.warnings, options)),
+    harness.toolCallHandler(event, createMockContext(harness.cwd, harness.prompts, harness.warnings, options)),
   );
   return (result ?? {}) as Record<string, unknown>;
+}
+
+async function runSlashCommand(harness: Harness, name: string, args = ""): Promise<void> {
+  const slashCommand = harness.slashCommands[name];
+  assert.equal(typeof slashCommand, "function");
+  await Promise.resolve(
+    slashCommand(args, createMockContext(harness.cwd, harness.prompts, harness.warnings, { hasUI: true })),
+  );
 }
 
 await runTest("JSONC config parses supported tools and ignores unknown states", () => {
@@ -376,6 +410,49 @@ await runTest("tool_call blocks ask when no UI is available", async () => {
 
     assert.equal(result.block, true);
     assert.match(String(result.reason), /requires approval, but no interactive UI is available/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("--yolo bypasses permission checks including global deny rules", async () => {
+  const harness = createHarness(`{"bash": {"rm -rf .*": "deny"}}`, null, { yoloFlag: true });
+  try {
+    const result = await runToolCall(harness, {
+      toolName: "bash",
+      input: { command: "rm -rf build" },
+    });
+
+    assert.deepEqual(result, {});
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("/yolo toggles permission checks for the current session", async () => {
+  const harness = createHarness(`{"bash": {"rm -rf .*": "deny"}}`, null);
+  try {
+    const deniedBeforeToggle = await runToolCall(harness, {
+      toolName: "bash",
+      input: { command: "rm -rf build" },
+    });
+    assert.equal(deniedBeforeToggle.block, true);
+
+    await runSlashCommand(harness, "yolo");
+    const allowedWhileEnabled = await runToolCall(harness, {
+      toolName: "bash",
+      input: { command: "rm -rf build" },
+    });
+    assert.deepEqual(allowedWhileEnabled, {});
+
+    await runSlashCommand(harness, "yolo");
+    const deniedAfterToggle = await runToolCall(harness, {
+      toolName: "bash",
+      input: { command: "rm -rf build" },
+    });
+    assert.equal(deniedAfterToggle.block, true);
+
+    assert.deepEqual(harness.warnings, ["info: YOLO mode enabled", "info: YOLO mode disabled"]);
   } finally {
     harness.cleanup();
   }
