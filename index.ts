@@ -1,4 +1,9 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ToolCallEvent,
+  ToolCallEventResult,
+} from "@earendil-works/pi-coding-agent";
 
 import { createPathMatchCandidates, getNonEmptyString, normalizePathForPermission, toRecord } from "./src/common.js";
 import {
@@ -11,14 +16,7 @@ import {
 import { compileRules, findLastGlobalMatch, findLastMatch, type CompiledRule, type RuleMatch } from "./src/matcher.js";
 import type { PermissionCheckResult, SupportedToolName } from "./src/types.js";
 
-const SUPPORTED_TOOLS = new Set<string>(["bash", "read", "edit", "write"]);
-
-type ToolCallEventLike = {
-  toolName?: unknown;
-  name?: unknown;
-  input?: unknown;
-  arguments?: unknown;
-};
+const SUPPORTED_TOOLS = new Set<string>(["bash", "read", "edit", "write"] satisfies SupportedToolName[]);
 
 type RuntimePolicy = CachedPolicy & {
   compiledRules: CompiledRule[];
@@ -28,20 +26,8 @@ let cachedPolicy: RuntimePolicy | null = null;
 let cachedCwd: string | undefined;
 let yoloEnabled = false;
 
-function getEventToolName(event: ToolCallEventLike): string | null {
-  return getNonEmptyString(event.toolName) ?? getNonEmptyString(event.name);
-}
-
-function getEventInput(event: ToolCallEventLike): unknown {
-  if (event.input !== undefined) {
-    return event.input;
-  }
-
-  if (event.arguments !== undefined) {
-    return event.arguments;
-  }
-
-  return {};
+function isSupportedToolName(toolName: string): toolName is SupportedToolName {
+  return SUPPORTED_TOOLS.has(toolName);
 }
 
 function loadPolicy(ctx: ExtensionContext): RuntimePolicy {
@@ -190,10 +176,8 @@ export default function minimalPermissionExtension(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("tool_call", async (event: unknown, ctx) => {
-    const toolEvent = toRecord(event) as ToolCallEventLike;
-    const toolName = getEventToolName(toolEvent);
-    if (!toolName || !SUPPORTED_TOOLS.has(toolName)) {
+  pi.on("tool_call", async (event: ToolCallEvent, ctx): Promise<ToolCallEventResult> => {
+    if (!isSupportedToolName(event.toolName)) {
       return {};
     }
 
@@ -203,8 +187,8 @@ export default function minimalPermissionExtension(pi: ExtensionAPI): void {
 
     const policy = loadPolicy(ctx);
     const result = checkPermission(
-      toolName as SupportedToolName,
-      getEventInput(toolEvent),
+      event.toolName,
+      event.input,
       ctx.cwd,
       policy,
     );
