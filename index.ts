@@ -202,7 +202,17 @@ export default function minimalPermissionExtension(pi: ExtensionAPI): void {
         return { block: true, reason: formatUnavailableReason(result) };
       }
 
-      const approved = await ctx.ui.confirm("Permission Required", formatAskPrompt(result));
+      const signal = ctx.signal;
+      const cancelled = { block: true, reason: "Permission request cancelled because the agent turn was aborted." };
+      if (signal?.aborted) {
+        return cancelled;
+      }
+
+      const approved = await ctx.ui.confirm("Permission Required", formatAskPrompt(result), { signal });
+      // Abort can race with an approval before this handler resumes.
+      if (signal?.aborted) {
+        return cancelled;
+      }
       if (!approved) {
         return { block: true, reason: formatUserDeniedReason(result) };
       }
