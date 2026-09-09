@@ -18,6 +18,12 @@ import type { PermissionCheckResult, SupportedToolName } from "./src/types.js";
 
 const SUPPORTED_TOOLS = new Set<string>(["bash", "read", "edit", "write"] satisfies SupportedToolName[]);
 
+// Deliberately not a "denial": the user stopped the turn, they did not refuse the tool.
+const CANCELLED_BY_ABORT: ToolCallEventResult = {
+  block: true,
+  reason: "Permission request cancelled because the agent turn was aborted.",
+};
+
 type RuntimePolicy = CachedPolicy & {
   compiledRules: CompiledRule[];
 };
@@ -203,15 +209,14 @@ export default function minimalPermissionExtension(pi: ExtensionAPI): void {
       }
 
       const signal = ctx.signal;
-      const cancelled = { block: true, reason: "Permission request cancelled because the agent turn was aborted." };
       if (signal?.aborted) {
-        return cancelled;
+        return CANCELLED_BY_ABORT;
       }
 
       const approved = await ctx.ui.confirm("Permission Required", formatAskPrompt(result), { signal });
       // Abort can race with an approval before this handler resumes.
       if (signal?.aborted) {
-        return cancelled;
+        return CANCELLED_BY_ABORT;
       }
       if (!approved) {
         return { block: true, reason: formatUserDeniedReason(result) };
