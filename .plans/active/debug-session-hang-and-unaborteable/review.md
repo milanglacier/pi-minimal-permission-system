@@ -113,3 +113,73 @@ install.
 
 Running Pi sessions still hold the old extension code and need a user-approved reload to
 adopt the fix; nothing was restarted.
+
+---
+
+# Second round of review (extension side)
+
+Reviewed the branch again after the first round's fixes landed, as the extension half of the
+joint change with Tau's `fix/abort-permission-waits`. The Tau-side second round is in that
+repository's `.plans/active/debug-session-hang-and-unaborteable/review.md`.
+
+`npm run check` passes here (strict typecheck plus 25 behaviour tests), and Tau's full suite
+passes 223/223 with nothing skipped, which includes the six real-Pi RPC scenarios that load
+this checkout's `index.ts`.
+
+## Verdict
+
+Still correct, still minimal, and I would still merge it. The plan describes the real
+mechanism, the twelve-line change is the right fix for it, and the tests genuinely fail
+without it. This round I went looking specifically for ways the change could fail open or
+could behave differently outside RPC mode, and found none.
+
+## What this round re-verified
+
+- Capturing `const signal = ctx.signal` **before** the await is load-bearing, not incidental
+  style. Pi types `ctx.signal` as `AbortSignal | undefined` and documents it as undefined when
+  the agent is not streaming, so re-reading `ctx.signal` after the confirmation resolved could
+  silently hand back `undefined` and lose the abort. The current code reads it once and
+  re-checks that same captured signal, which is the correct shape.
+- Neither Pi UI implementation rejects on abort, so the fix does not depend on catching
+  anything. RPC's `createDialogPromise` resolves the confirm to its default `false` and deletes
+  its pending record; the interactive mode routes `confirm` through `showExtensionSelector` and
+  maps a non-"Yes" result to `false`. In both modes the raw result is indistinguishable from a
+  user pressing No, which is exactly why the post-await `signal?.aborted` re-check is what
+  keeps an aborted turn from being reported to the model as a user denial. Both the pre-check
+  and the re-check are needed and neither is redundant.
+- Pi's `emitToolCall` does not wrap `tool_call` handlers in try/catch the way `emitUserBash`
+  does, so it matters that this handler always returns a result rather than throwing. It does.
+- The "approve then abort in the same tick" test is a real regression test rather than a
+  tautology, and it matches the real ordering: Pi's stdin reader dispatches each line with
+  `void handleInputLine(line)`, so when an approval and an abort arrive in the same chunk the
+  abort's synchronous `session.abort()` runs before the extension's continuation microtask and
+  the re-check sees the aborted signal.
+
+## Findings
+
+1. Low — `index.ts`, the ask branch of the `tool_call` handler. When `ctx.signal` is
+   `undefined`, the extension passes `{ signal: undefined }` and the confirmation is unbounded
+   again, which is precisely the pre-fix behaviour. Nothing in `tests/permission-system.test.ts`
+   covers that path: every cancellation test supplies a controller. In practice a `tool_call`
+   hook only fires inside an agent run, so the signal should always be present, and Tau's
+   dialog registry would be the fallback — but this plan explicitly says the extension fix must
+   work without depending on Tau. A single test asserting what happens with no signal, or a
+   comment stating that the unbounded wait is knowingly accepted there, would make the
+   assumption visible instead of implicit.
+
+2. Nit — the cancellation reason text ("Permission request cancelled because the agent turn
+   was aborted.") is asserted in the tests only through the regex `/cancelled.*aborted/i` plus
+   the negative `/denied|policy-enforced|Hard stop/i`. That is the right thing to pin, since the
+   distinction from a denial is the point, but the wording itself is now part of what the model
+   sees on an aborted turn and no test pins it exactly. Worth a single equality assertion if the
+   exact phrasing is meant to be stable.
+
+## Nothing outstanding from round one
+
+Both minor notes from the first round were addressed as described: the cancellation result is
+a module-level `CANCELLED_BY_ABORT` constant typed as `ToolCallEventResult`, and the Pi
+development dependency is now `^0.85.1`, matching the line the runtime validation runs against
+while `peerDependencies` stays `*` on purpose.
+
+As before, no Pi configuration, symlink, session file, or live process was touched; running
+sessions still hold the old extension code and need a user-approved reload to adopt the fix.
