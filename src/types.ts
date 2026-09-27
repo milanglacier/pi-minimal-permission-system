@@ -20,6 +20,11 @@ export interface PermissionCheckResult {
   state: PermissionState;
   matchedPattern?: string;
   matchedLayer?: PermissionLayerName;
+  /** Complete bash input, as submitted by the tool call. */
   command?: string;
+  /** Command within the bash input whose decision determined `state`. */
+  decisiveCommand?: string;
+  /** Why bash rules were matched against the complete input instead of each command. */
+  fallbackReason?: string;
   path?: string;
 }

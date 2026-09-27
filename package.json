@@ -25,7 +25,7 @@
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx ./tests/permission-system.test.ts",
+    "test": "tsx ./tests/permission-system.test.ts && tsx ./tests/shell.test.ts",
     "check": "npm run typecheck && npm run test"
   },
   "keywords": [
@@ -45,7 +45,8 @@
   "dependencies": {
     "jsonc-parser": "^3.3.1",
     "picomatch": "^4.0.2",
-    "sh-syntax": "^0.7.0"
+    "tree-sitter-bash": "~0.25.1",
+    "web-tree-sitter": "~0.27.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.86.0 <=0.100.0",

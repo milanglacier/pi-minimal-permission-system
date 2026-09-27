@@ -14,9 +14,12 @@ import {
   type CachedPolicy,
 } from "./src/config.js";
 import { compileRules, findLastGlobalMatch, findLastMatch, type CompiledRule, type RuleMatch } from "./src/matcher.js";
-import type { PermissionCheckResult, SupportedToolName } from "./src/types.js";
+import { analyzeShellCommand } from "./src/shell.js";
+import type { PermissionCheckResult, PermissionState, SupportedToolName } from "./src/types.js";
 
 const SUPPORTED_TOOLS = new Set<string>(["bash", "read", "edit", "write"] satisfies SupportedToolName[]);
+
+const STATE_SEVERITY: Record<PermissionState, number> = { allow: 0, ask: 1, deny: 2 };
 
 // Deliberately not a "denial": the user stopped the turn, they did not refuse the tool.
 const CANCELLED_BY_ABORT: ToolCallEventResult = {
@@ -78,25 +81,56 @@ function resolveRuleMatch(
   return match;
 }
 
-function checkPermission(
-  toolName: SupportedToolName,
-  input: unknown,
-  cwd: string | undefined,
-  policy: RuntimePolicy,
-): PermissionCheckResult {
-  const record = toRecord(input);
+async function checkBashPermission(
+  command: string,
+  rules: readonly CompiledRule[],
+): Promise<PermissionCheckResult> {
+  const analysis = await analyzeShellCommand(command);
 
-  if (toolName === "bash") {
-    const command = getNonEmptyString(record.command) ?? "";
-    const match = resolveRuleMatch(policy.compiledRules, toolName, [command]);
-
+  if (analysis.kind === "fallback") {
+    const match = resolveRuleMatch(rules, "bash", [command]);
     return {
-      toolName,
+      toolName: "bash",
       state: match?.state ?? "ask",
       matchedPattern: match?.matchedPattern,
       matchedLayer: match?.matchedLayer,
       command,
+      fallbackReason: analysis.reason,
     };
+  }
+
+  // Resolve each command on its own so no rule can span sibling commands. The most
+  // restrictive decision wins; among equals, the earliest command explains the result.
+  let decisive: PermissionCheckResult | undefined;
+  for (const unit of analysis.units) {
+    const match = resolveRuleMatch(rules, "bash", [unit.text]);
+    const state = match?.state ?? "ask";
+
+    if (!decisive || STATE_SEVERITY[state] > STATE_SEVERITY[decisive.state]) {
+      decisive = {
+        toolName: "bash",
+        state,
+        matchedPattern: match?.matchedPattern,
+        matchedLayer: match?.matchedLayer,
+        command,
+        decisiveCommand: unit.text,
+      };
+    }
+  }
+
+  return decisive ?? { toolName: "bash", state: "ask", command };
+}
+
+async function checkPermission(
+  toolName: SupportedToolName,
+  input: unknown,
+  cwd: string | undefined,
+  policy: RuntimePolicy,
+): Promise<PermissionCheckResult> {
+  const record = toRecord(input);
+
+  if (toolName === "bash") {
+    return checkBashPermission(getNonEmptyString(record.command) ?? "", policy.compiledRules);
   }
 
   const pathValue = getNonEmptyString(record.path) ?? getNonEmptyString(record.file_path) ?? "";
@@ -113,13 +147,35 @@ function checkPermission(
   };
 }
 
-function formatMatchSuffix(result: PermissionCheckResult): string {
+function formatMatch(result: PermissionCheckResult): string | null {
   if (!result.matchedPattern) {
-    return "";
+    return null;
   }
 
   const layer = result.matchedLayer ? ` from ${result.matchedLayer} config` : "";
-  return ` (matched '${result.matchedPattern}'${layer})`;
+  return `matched '${result.matchedPattern}'${layer}`;
+}
+
+function formatMatchSuffix(result: PermissionCheckResult): string {
+  const match = formatMatch(result);
+  return match ? ` (${match})` : "";
+}
+
+function formatBashDecisionSuffix(result: PermissionCheckResult): string {
+  const details: string[] = [];
+  const match = formatMatch(result);
+
+  if (result.decisiveCommand && result.decisiveCommand !== result.command) {
+    details.push(`command '${result.decisiveCommand}' ${match ?? "matched no rule"}`);
+  } else if (match) {
+    details.push(match);
+  }
+
+  if (result.fallbackReason) {
+    details.push(`rules were matched against the whole input because ${result.fallbackReason}`);
+  }
+
+  return details.length > 0 ? ` (${details.join("; ")})` : "";
 }
 
 function hardStop(): string {
@@ -128,7 +184,7 @@ function hardStop(): string {
 
 function formatDenyReason(result: PermissionCheckResult): string {
   if (result.toolName === "bash") {
-    return `Permission denied for bash command '${result.command ?? ""}'${formatMatchSuffix(result)}. ${hardStop()}`;
+    return `Permission denied for bash command '${result.command ?? ""}'${formatBashDecisionSuffix(result)}. ${hardStop()}`;
   }
 
   return `Permission denied for ${result.toolName} on '${result.path ?? ""}'${formatMatchSuffix(result)}. ${hardStop()}`;
@@ -136,7 +192,7 @@ function formatDenyReason(result: PermissionCheckResult): string {
 
 function formatAskPrompt(result: PermissionCheckResult): string {
   if (result.toolName === "bash") {
-    return `Allow bash command '${result.command ?? ""}'${formatMatchSuffix(result)}?`;
+    return `Allow bash command '${result.command ?? ""}'${formatBashDecisionSuffix(result)}?`;
   }
 
   return `Allow ${result.toolName} on '${result.path ?? ""}'${formatMatchSuffix(result)}?`;
@@ -144,7 +200,7 @@ function formatAskPrompt(result: PermissionCheckResult): string {
 
 function formatUnavailableReason(result: PermissionCheckResult): string {
   if (result.toolName === "bash") {
-    return `Bash command '${result.command ?? ""}' requires approval, but no interactive UI is available.`;
+    return `Bash command '${result.command ?? ""}'${formatBashDecisionSuffix(result)} requires approval, but no interactive UI is available.`;
   }
 
   return `${result.toolName} on '${result.path ?? ""}' requires approval, but no interactive UI is available.`;
@@ -192,7 +248,7 @@ export default function minimalPermissionExtension(pi: ExtensionAPI): void {
     }
 
     const policy = loadPolicy(ctx);
-    const result = checkPermission(
+    const result = await checkPermission(
       event.toolName,
       event.input,
       ctx.cwd,

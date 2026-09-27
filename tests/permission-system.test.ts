@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -715,4 +715,238 @@ await runTest("/yolo toggles permission checks for the current session", async (
   } finally {
     harness.cleanup();
   }
+});
+
+type Decision = "allow" | "ask" | "deny";
+
+// Without a UI, an ask decision blocks with a distinct reason, so each outcome is observable.
+async function decideBash(harness: Harness, command: string): Promise<Decision> {
+  const result = await runToolCall(harness, { toolName: "bash", input: { command } });
+  if (result.block !== true) {
+    return "allow";
+  }
+
+  const reason = String(result.reason);
+  if (/no interactive UI is available/.test(reason)) {
+    return "ask";
+  }
+  if (/^Permission denied/.test(reason)) {
+    return "deny";
+  }
+  throw new Error(`Unexpected tool_call result: ${reason}`);
+}
+
+async function withHarness(
+  globalConfig: string | null,
+  projectConfig: string | null,
+  operation: (harness: Harness) => Promise<void>,
+): Promise<void> {
+  const harness = await createHarness(globalConfig, projectConfig);
+  try {
+    await operation(harness);
+  } finally {
+    harness.cleanup();
+  }
+}
+
+async function assertDecisions(harness: Harness, cases: ReadonlyArray<readonly [string, Decision]>): Promise<void> {
+  for (const [command, expected] of cases) {
+    assert.equal(await decideBash(harness, command), expected, `Unexpected decision for ${JSON.stringify(command)}`);
+  }
+}
+
+// The policy documented in README.md.
+const README_BASH_POLICY = String.raw`{
+  "bash": {
+    ".*": "allow",
+
+    "rm -r": "ask",
+    "rm -f": "ask",
+
+    // Allow a named directory directly under /tmp.
+    "^rm -rf /tmp/[\\w-][\\w.-]*$": "allow",
+
+    // Trust this quoted temporary-directory variable by name.
+    "^rm -rf \"\\$tmp\"$": "allow",
+    "^rm -rf \"\\$\\{tmp\\}\"$": "allow"
+  }
+}`;
+
+await runTest("README policy allows temporary cleanup and asks before other forced deletions", async () => {
+  await withHarness(README_BASH_POLICY, null, async (harness) => {
+    await assertDecisions(harness, [
+      ["rm -rf /tmp/tmp.ABC123", "allow"],
+      ["rm -rf \"$tmp\"", "allow"],
+      ["rm -rf \"${tmp}\"", "allow"],
+      ["tmp=$(mktemp -d); rm -rf \"${tmp}\"", "allow"],
+      ["tmp=$(mktemp -d)\ncd \"$tmp\" && touch file\nrm -rf \"${tmp}\"", "allow"],
+      ["rm -rf ~/important", "ask"],
+      ["rm -f /tmp/test", "ask"],
+      ["rm -rf \"$tmp\"; rm -rf ~/important", "ask"],
+      ["rm -rf ~/important; rm -rf \"$tmp\"", "ask"],
+      ["rm -rf /tmp/test ~/important", "ask"],
+      ["rm -rf /tmp", "ask"],
+      ["rm -rf /tmp/..", "ask"],
+      ["echo \"$(rm -rf ~/important)\"; rm -rf \"$tmp\"", "ask"],
+    ]);
+  });
+});
+
+await runTest("a deny in any command blocks the call regardless of later cleanup allows", async () => {
+  const policy = String.raw`{"bash": {".*": "allow", "sudo": "ask", "^rm -rf ~": "deny", "^rm -rf \"\\$tmp\"$": "allow"}}`;
+  await withHarness(policy, null, async (harness) => {
+    await assertDecisions(harness, [
+      ["rm -rf ~/important; rm -rf \"$tmp\"", "deny"],
+      ["rm -rf \"$tmp\" && rm -rf ~/important", "deny"],
+      ["sudo ls | rm -rf ~/important", "deny"],
+      ["sudo ls; rm -rf \"$tmp\"", "ask"],
+    ]);
+  });
+});
+
+await runTest("global and project precedence applies within each command", async () => {
+  await withHarness(
+    `{"bash": {".*": "allow", "rm -rf .*": "deny"}}`,
+    `{"bash": {"^rm -rf build$": "allow", "^git push": "ask"}}`,
+    async (harness) => {
+      await assertDecisions(harness, [
+        ["echo ok && rm -rf build", "deny"],
+        ["git status && git push origin main", "ask"],
+        ["git status", "allow"],
+      ]);
+    },
+  );
+});
+
+await runTest("anchored rules apply to individual commands instead of the whole script", async () => {
+  await withHarness(`{"bash": {"^git status$": "allow", ".*": "allow", "cd .* && git push": "deny"}}`, null, async (harness) => {
+    await assertDecisions(harness, [
+      // Rules spanning sibling commands no longer match once the script is parsed.
+      ["cd repo && git push", "allow"],
+    ]);
+  });
+  await withHarness(`{"bash": {"^git status$": "allow"}}`, null, async (harness) => {
+    await assertDecisions(harness, [
+      ["git status", "allow"],
+      ["git status; git status", "allow"],
+      ["git status && rm x", "ask"],
+    ]);
+  });
+});
+
+await runTest("rules match string arguments and nested substitutions of the complete invocation", async () => {
+  await withHarness(README_BASH_POLICY, null, async (harness) => {
+    await assertDecisions(harness, [
+      ["bash -c \"rm -rf ~/important\"", "ask"],
+      ["bash -c \"echo hello; echo world\"", "allow"],
+      ["bash -c \"echo $(rm -rf ~/important)\"", "ask"],
+    ]);
+  });
+});
+
+await runTest("commands with unresolved behavior use ordinary matching", async () => {
+  await withHarness(`{"bash": {".*": "allow", "^eval\\\\b": "deny"}}`, null, async (harness) => {
+    await assertDecisions(harness, [
+      ["$cmd --flag; \"${tool}\" run", "allow"],
+      ["xargs rm < list", "allow"],
+      ["eval \"$script\"", "deny"],
+    ]);
+  });
+});
+
+await runTest("unparseable input matches the whole input with existing precedence", async () => {
+  const input = "echo ok; if";
+  const cases: ReadonlyArray<readonly [string, string | null, Decision]> = [
+    [`{"bash": {"^echo ok; if$": "allow"}}`, null, "allow"],
+    [`{"bash": {".*": "allow", "; if$": "ask"}}`, null, "ask"],
+    [`{"bash": {".*": "allow", "^echo": "deny"}}`, null, "deny"],
+    [`{"bash": {"^never$": "allow"}}`, null, "ask"],
+    [`{"bash": {"if$": "deny"}}`, `{"bash": {".*": "allow"}}`, "deny"],
+    // Partial extraction would yield `echo ok`; its decision must not replace the whole-input decision.
+    [`{"bash": {".*": "ask", "^echo ok$": "allow"}}`, null, "ask"],
+    [`{"bash": {"^echo ok; if$": "allow", "^echo ok$": "deny"}}`, null, "allow"],
+  ];
+
+  for (const [globalConfig, projectConfig, expected] of cases) {
+    await withHarness(globalConfig, projectConfig, async (harness) => {
+      assert.equal(await decideBash(harness, input), expected, `Unexpected decision under ${globalConfig}`);
+    });
+  }
+});
+
+await runTest("input without commands matches the whole input", async () => {
+  await withHarness(`{"bash": {".*": "allow", "rm -rf": "deny"}}`, null, async (harness) => {
+    await assertDecisions(harness, [["# rm -rf /", "deny"]]);
+  });
+  await withHarness(`{"bash": {"^never$": "allow"}}`, null, async (harness) => {
+    await assertDecisions(harness, [["# just a comment", "ask"]]);
+  });
+});
+
+await runTest("one prompt covers the whole input and explains the decisive command", async () => {
+  await withHarness(README_BASH_POLICY, null, async (harness) => {
+    const result = await runToolCall(
+      harness,
+      { toolName: "bash", input: { command: "rm -rf \"$tmp\"; rm -rf ~/a; rm -f ~/b" } },
+      { hasUI: true },
+    );
+
+    assert.deepEqual(result, {});
+    assert.equal(harness.prompts.length, 1);
+    assert.equal(
+      harness.prompts[0],
+      "Allow bash command 'rm -rf \"$tmp\"; rm -rf ~/a; rm -f ~/b' (command 'rm -rf ~/a' matched 'rm -r' from global config)?",
+    );
+  });
+});
+
+await runTest("prompts explain commands without a matching rule and single-command matches", async () => {
+  await withHarness(`{"bash": {"^echo": "allow", "^sudo": "ask"}}`, null, async (harness) => {
+    await runToolCall(harness, { toolName: "bash", input: { command: "echo a; ls" } }, { hasUI: true });
+    await runToolCall(harness, { toolName: "bash", input: { command: "sudo ls" } }, { hasUI: true });
+
+    assert.deepEqual(harness.prompts, [
+      "Allow bash command 'echo a; ls' (command 'ls' matched no rule)?",
+      "Allow bash command 'sudo ls' (matched '^sudo' from global config)?",
+    ]);
+  });
+});
+
+await runTest("prompts and denials explain whole-input fallback", async () => {
+  await withHarness(`{"bash": {".*": "ask", "^rm": "deny"}}`, null, async (harness) => {
+    await runToolCall(harness, { toolName: "bash", input: { command: "echo ok; if" } }, { hasUI: true });
+    const denied = await runToolCall(harness, { toolName: "bash", input: { command: "rm x; if" } });
+
+    assert.deepEqual(harness.prompts, [
+      "Allow bash command 'echo ok; if' (matched '.*' from global config; rules were matched against the whole input because the input could not be parsed)?",
+    ]);
+    assert.equal(denied.block, true);
+    assert.match(String(denied.reason), /matched '\^rm' from global config; rules were matched against the whole input/);
+    assert.match(String(denied.reason), /Hard stop/);
+  });
+});
+
+await runTest("denials name the decisive command", async () => {
+  await withHarness(`{"bash": {".*": "allow", "^rm -rf ~": "deny"}}`, null, async (harness) => {
+    const result = await runToolCall(harness, { toolName: "bash", input: { command: "ls && rm -rf ~/a" } });
+
+    assert.equal(result.block, true);
+    assert.match(
+      String(result.reason),
+      /^Permission denied for bash command 'ls && rm -rf ~\/a' \(command 'rm -rf ~\/a' matched '\^rm -rf ~' from global config\)\. Hard stop/,
+    );
+  });
+});
+
+await runTest("editing the policy file invalidates cached bash rules", async () => {
+  await withHarness(`{"bash": {".*": "allow"}}`, null, async (harness) => {
+    assert.equal(await decideBash(harness, "echo ok; rm x"), "allow");
+
+    const path = getHomeConfigPath(harness.home);
+    writeJsonc(path, `{"bash": {".*": "allow", "^rm": "deny"}}`);
+    const later = new Date(Date.now() + 5_000);
+    utimesSync(path, later, later);
+
+    assert.equal(await decideBash(harness, "echo ok; rm x"), "deny");
+  });
 });
