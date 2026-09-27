@@ -150,6 +150,33 @@ allowed without loading policy, checking rules, prompting, or honoring global
 }
 ```
 
+### Allow `rm -r`/`rm -f` in temp paths, ask elsewhere
+
+Bash rules are evaluated against the whole command string and the **last**
+matching rule wins, so put the permissive temp-path rule before the catch-all
+`ask` rules:
+
+```jsonc
+{
+  "bash": {
+    ".*": "allow",
+    // Ask for any rm with -r/-R/-f style flags.
+    "rm\\s+-[rRf]+": "ask",
+    // Allow it on a single temp target: /tmp/<name>, or a shell variable whose
+    // name contains tmp/temp, e.g. "$tmp" or "${tempdir}".
+    "rm\\s+-[rRf]+\\s+(\"?/tmp/[\\w.-][\\w./-]*\"?|\"?\\$\\{?\\w*(tmp|TMP|temp|TEMP)\\w*\\}?\"?)": "allow",
+    // Ask again if such an rm has a target that is not a single temp path.
+    "rm\\s+-[rRf]+\\s+(?!(\"?/tmp/[\\w.-][\\w./-]*\"?|\"?\\$\\{?\\w*(tmp|TMP|temp|TEMP)\\w*\\}?\"?)\\s*([;&|)'\\n]|$))": "ask",
+    // Ask ".." targets, even under /tmp.
+    "rm\\s+-[rRf]+\\s+.*\\.\\.": "ask",
+  },
+}
+```
+
+`rm -rf /tmp/build`, `rm -f /tmp/x.log`, and `rm -rf "$tmp"` run without
+prompting. `rm -rf ./build`, `rm -rf /tmp/a /tmp/b`, and `rm -rf /tmp/../etc`
+ask for confirmation.
+
 ### Per-project override
 
 Global `~/.pi/agent/permissions.jsonc`:
