@@ -8,6 +8,10 @@ unrestricted, built-in tool calls (`read`, `edit`, `write`, and `bash`) are
 checked against a simple policy that you control. MCP tools and other
 extensions are intentionally out of scope.
 
+Pi's `codemode` tool (0.99.1+) does **not** bypass the policy: any `read`,
+`edit`, `write`, or `bash` call a codemode script makes is still checked by
+this extension, just like a call from the model.
+
 ## Philosophy
 
 Pi is designed to be minimal. This extension follows the same approach:
