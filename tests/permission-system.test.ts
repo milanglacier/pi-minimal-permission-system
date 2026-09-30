@@ -3,7 +3,17 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  BashToolCallEvent, EditToolCallEvent, ExtensionAPI, ExtensionContext,
+  GrepToolCallEvent, ReadToolCallEvent, SessionStartEvent, ToolCallEvent, ToolCallEventResult, WriteToolCallEvent,
+} from "@earendil-works/pi-coding-agent";
+
+type ToolFixture =
+  | Pick<BashToolCallEvent, "toolName" | "input">
+  | Pick<ReadToolCallEvent, "toolName" | "input">
+  | Pick<EditToolCallEvent, "toolName" | "input">
+  | Pick<WriteToolCallEvent, "toolName" | "input">
+  | Pick<GrepToolCallEvent, "toolName" | "input">;
 
 import minimalPermissionExtension from "../index.js";
 import { getGlobalConfigPath, parsePermissionConfig, resolvePermissionRules } from "../src/config.js";
@@ -58,9 +68,9 @@ function findEffectiveMatch(rules: PermissionRule[], toolName: PermissionRule["t
 }
 
 type MockEventHandler = (
-  event: Record<string, unknown>,
+  event: SessionStartEvent | ToolCallEvent,
   ctx: Record<string, unknown>,
-) => Promise<Record<string, unknown> | void> | Record<string, unknown> | void;
+) => Promise<ToolCallEventResult | void> | ToolCallEventResult | void;
 
 type MockSlashCommandHandler = (args: string, ctx: Record<string, unknown>) => Promise<void> | void;
 
@@ -107,14 +117,16 @@ async function createHarness(
     flagValues.set("yolo", true);
   }
 
-  minimalPermissionExtension({
-    on(name: string, handler: MockEventHandler): void {
+  const api = {
+    // This adapter stores the overloaded SDK callbacks for the partial runtime harness.
+    on: ((name: string, handler: MockEventHandler): (() => void) => {
       eventHandlers[name] = handler;
+      return () => {};
+    }) as unknown as ExtensionAPI["on"],
+    registerCommand(name, commandOptions): void {
+      slashCommands[name] = commandOptions.handler as unknown as MockSlashCommandHandler;
     },
-    registerCommand(name: string, commandOptions: { handler: MockSlashCommandHandler }): void {
-      slashCommands[name] = commandOptions.handler;
-    },
-    registerFlag(name: string, flagOptions: { default?: boolean | string }): void {
+    registerFlag(name, flagOptions): void {
       if (flagOptions.default !== undefined && !flagValues.has(name)) {
         flagValues.set(name, flagOptions.default);
       }
@@ -122,7 +134,10 @@ async function createHarness(
     getFlag(name: string): boolean | string | undefined {
       return flagValues.get(name);
     },
-  } as never);
+  } satisfies Pick<ExtensionAPI, "on" | "registerCommand" | "registerFlag" | "getFlag">;
+
+  // The harness implements only the registration methods used by this extension.
+  minimalPermissionExtension(api as ExtensionAPI);
 
   assert.equal(typeof eventHandlers.tool_call, "function");
   assert.equal(typeof eventHandlers.session_start, "function");
@@ -268,19 +283,22 @@ function createMockContext(
         return options.confirm?.(title, message, dialogOptions) ?? Promise.resolve(true);
       },
     } satisfies Pick<ExtensionContext["ui"], "notify" | "confirm">,
+  } satisfies Pick<ExtensionContext, "cwd" | "hasUI" | "signal"> & {
+    ui: Pick<ExtensionContext["ui"], "notify" | "confirm">;
   };
 }
 
 async function runToolCall(
   harness: Harness,
-  event: Record<string, unknown>,
+  event: ToolFixture,
   options: MockContextOptions = {},
-): Promise<Record<string, unknown>> {
+): Promise<ToolCallEventResult> {
+  const toolEvent: ToolCallEvent = { type: "tool_call", toolCallId: "test-call", ...event };
   const result = await harness.toolCallHandler(
-    event,
+    toolEvent,
     createMockContext(harness.cwd, harness.prompts, harness.warnings, options),
   );
-  return (result ?? {}) as Record<string, unknown>;
+  return result ?? {};
 }
 
 async function runSlashCommand(harness: Harness, name: string, args = ""): Promise<void> {
@@ -289,7 +307,7 @@ async function runSlashCommand(harness: Harness, name: string, args = ""): Promi
   await slashCommand(args, createMockContext(harness.cwd, harness.prompts, harness.warnings, { hasUI: true }));
 }
 
-const askToolCalls = [
+const askToolCalls: ToolFixture[] = [
   { toolName: "bash", input: { command: "printf permission-test", timeout: 1 } },
   { toolName: "read", input: { path: "notes.txt" } },
   { toolName: "edit", input: { path: "notes.txt", edits: [{ oldText: "hello", newText: "goodbye" }] } },
