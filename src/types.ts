@@ -8,6 +8,20 @@ export type PermissionConfig = Partial<Record<SupportedToolName, ToolPermissions
 
 export type PermissionLayerName = "global" | "project";
 
+export interface CodemodePermissionRule {
+  selector: string;
+  state: PermissionState;
+  layer: PermissionLayerName;
+  configPath: string;
+  compiledSelector: import("esquery").Selector;
+}
+
+export interface CodemodePolicyDiagnostic {
+  configPath: string;
+  message: string;
+  selector?: string;
+}
+
 export interface PermissionRule {
   toolName: SupportedToolName;
   pattern: string;

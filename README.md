@@ -3,26 +3,22 @@
 A minimal permission enforcement extension for the [Pi coding
 agent](https://github.com/earendil-works/pi-coding-agent).
 
-This extension adds a lightweight permission layer to Pi. Instead of running
-unrestricted, built-in tool calls (`read`, `edit`, `write`, and `bash`) are
-checked against a simple policy that you control. MCP tools and other
-extensions are intentionally out of scope.
+This extension checks `read`, `edit`, `write`, and `bash` calls against rules
+you configure. These tools require approval when no rule matches. You can also
+restrict JavaScript syntax in Pi's `codemode` tool (Pi 0.99.1+).
 
-Pi's `codemode` tool (0.99.1+) does **not** bypass the policy: any `read`,
-`edit`, `write`, or `bash` call a codemode script makes is still checked by
-this extension, just like a call from the model.
+Codemode calls other tools, and those calls still go through their usual
+permission checks. Allowing codemode by default avoids asking twice. You can
+add rules to restrict the script itself.
 
 ## Philosophy
 
-Pi is designed to be minimal. This extension follows the same approach:
-
-- **Built-in tools only** — `read`, `edit`, `write`, and `bash`. MCP tools and
-  extension-provided tools are intentionally not covered.
-- **No granular subagent permissions** — just two layers: **global** and
-  **project-local**.
-- **Granular tool-level control** — `read`, `edit`, and `write` are governed
-  independently, so you can allow read-only access to sensitive paths while
-  blocking edits.
+- Policies cover `read`, `edit`, `write`, and `bash` calls, plus optional
+  codemode syntax checks. They do not cover MCP tools or other extension tools.
+- Rules have two layers: global and project-local. There are no separate
+  subagent policies.
+- File tools have independent rules, so you can allow reads while blocking
+  edits and writes.
 
 ## Installation
 
@@ -38,37 +34,40 @@ To pin a specific release:
 pi install npm:pi-minimal-permission-system@1.0.0
 ```
 
-For local development, you can still clone it into `~/.pi/agent/extensions`:
+For local development, clone the repository and install its dependencies:
 
 ```bash
 cd ~/.pi/agent/extensions
 git clone https://github.com/milanglacier/pi-minimal-permission-system.git
+cd pi-minimal-permission-system
+npm install
 ```
 
 ## Configuration
 
-Permissions are defined in JSONC (JSON with comments) files.
+Define permissions in JSONC files (JSON with comments). Use `allow` to permit a
+call, `deny` to block it, or `ask` to request approval. Calls that require
+approval are blocked when no interactive UI is available.
 
 ### Global config
 
 `~/.pi/agent/permissions.jsonc`
 
-Applies to **every** Pi session regardless of working directory.
+Applies to every Pi session. If `PI_CODING_AGENT_DIR` is set, the global file
+is `$PI_CODING_AGENT_DIR/permissions.jsonc`.
 
 ### Project-local config
 
 `<cwd>/.pi/agent/permissions.jsonc`
 
-Applies only when Pi's working directory is inside that project. Project rules are layered on top of global rules.
+Pi reads this file relative to its current working directory. It does not
+search parent directories for project policies. Project rules are combined
+with global rules using the precedence described below.
 
 ### Format
 
 ```jsonc
 {
-  // "allow"   -> silently permit
-  // "deny"    -> hard-block with an error
-  // "ask"     -> prompt the user for confirmation (default when no rule matches)
-
   "read": {
     "**": "allow",
     "/etc/**": "deny",
@@ -93,6 +92,10 @@ Applies only when Pi's working directory is inside that project. Project rules a
     "rm\\s+-rf\\s+/.*": "deny",
     "sudo\\b.*": "ask",
   },
+
+  "codemode": {
+    "DebuggerStatement": "deny",
+  },
 }
 ```
 
@@ -102,12 +105,24 @@ Applies only when Pi's working directory is inside that project. Project rules a
 | ----------------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `read`, `edit`, `write` | [picomatch](https://github.com/micromatch/picomatch) glob | Matches absolute path, relative path (from cwd), raw input, and basename. `dot: true` is enabled.                            |
 | `bash`                  | JavaScript RegExp                                         | Matched against the full command string. Must be a valid regex (the pattern string is passed to `new RegExp(pattern, "u")`). |
+| `codemode`              | [esquery](https://github.com/estools/esquery) AST selector | Matched against the submitted JavaScript parsed with Acorn. Matching is syntactic; aliases and runtime behavior are not resolved. |
 
 ### Precedence
 
-1. Rules are evaluated in config order: **global first, then project-local**.
-2. The **last matching rule wins**.
-3. **Global `deny` is special**: if the last match is not a `deny`, the system still checks whether any global rule issues a `deny`. This means you can safely set a global hard boundary (e.g. deny `/etc/**`) that cannot be accidentally overridden by a project-local rule.
+For `bash`, `read`, `edit`, and `write`:
+
+1. Evaluate rules in declaration order, global first and then project-local.
+2. Use the last matching rule. If none matches, require approval (`ask`).
+3. If the last matching global rule is `deny`, block the call regardless of
+   project rules. A later global rule can override an earlier global rule.
+
+For codemode, combine all matching selectors from both layers with
+**`deny > ask > allow`**, regardless of declaration order. A valid policy allows
+scripts when rules are absent or no selector matches. An `allow` rule cannot
+create an exception to a matching `ask` or `deny` rule.
+
+See the [Codemode permissions guide](docs/codemode-permissions.md) for syntax
+selectors, validation errors, and limitations. Syntax checks are not a sandbox.
 
 ### YOLO mode
 
@@ -115,9 +130,9 @@ Start Pi with `--yolo` or run `/yolo` during an interactive session to bypass
 all permission checks enforced by this extension. `/yolo` is a toggle; running
 it again restores normal permission enforcement.
 
-When YOLO mode is enabled, `bash`, `read`, `edit`, and `write` tool calls are
-allowed without loading policy, checking rules, prompting, or honoring global
-`deny` rules.
+YOLO bypasses policy loading, rule checks, and approval prompts for all covered
+tools, including codemode. It also bypasses global denials and codemode policy
+validation.
 
 ## Example workflows
 
@@ -129,14 +144,14 @@ allowed without loading policy, checking rules, prompting, or honoring global
     "**": "allow",
   },
   "edit": {
+    "**": "allow",
     "**/.ssh/**": "deny",
     "**/.gnupg/**": "deny",
-    "**": "allow",
   },
   "write": {
+    "**": "allow",
     "**/.ssh/**": "deny",
     "**/.gnupg/**": "deny",
-    "**": "allow",
   },
 }
 ```
@@ -156,9 +171,9 @@ allowed without loading policy, checking rules, prompting, or honoring global
 
 ### Allow `rm -r`/`rm -f` in temp paths, ask elsewhere
 
-Bash rules are evaluated against the whole command string and the **last**
-matching rule wins, so put the permissive temp-path rule before the catch-all
-`ask` rules:
+Bash rules inspect the command string, not the shell's parsed arguments or
+expanded variables. This example asks about `rm` flags, allows matching temp
+paths, then asks again for extra targets or `..`:
 
 ```jsonc
 {
@@ -179,7 +194,8 @@ matching rule wins, so put the permissive temp-path rule before the catch-all
 
 `rm -rf /tmp/build`, `rm -f /tmp/x.log`, and `rm -rf "$tmp"` run without
 prompting. `rm -rf ./build`, `rm -rf /tmp/a /tmp/b`, and `rm -rf /tmp/../etc`
-ask for confirmation.
+ask for confirmation. These regexes are convenience rules, not a guarantee
+that a command only affects temporary files.
 
 ### Per-project override
 
@@ -198,13 +214,14 @@ Project `my-app/.pi/agent/permissions.jsonc`:
 ```jsonc
 {
   "edit": {
-    "**/package.json": "ask",
     "**": "allow",
+    "**/package.json": "ask",
   },
 }
 ```
 
-Editing `package.json` inside `my-app` will prompt for confirmation; everywhere else it is allowed.
+With `my-app` as Pi's working directory, edits to `package.json` require
+approval. Other edits are allowed.
 
 ## Comparison with `pi-permission-system`
 
@@ -230,13 +247,9 @@ Editing `package.json` inside `my-app` will prompt for confirmation; everywhere 
 
 ## Development
 
-```bash
-# Type-check
-npm run typecheck
+Run `npm run check` to type-check the code and run all tests. Use
+`npm run typecheck` or `npm test` to run either check separately.
 
-# Run tests
-npm run test
-
-# Both
-npm run check
-```
+Integration tests use Pi's real codemode tool with isolated configuration and a
+deterministic provider. They require Pi 0.99.1 or a compatible release and make
+no external model requests.

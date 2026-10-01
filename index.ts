@@ -14,9 +14,12 @@ import {
   type CachedPolicy,
 } from "./src/config.js";
 import { compileRules, findLastGlobalMatch, findLastMatch, type CompiledRule, type RuleMatch } from "./src/matcher.js";
-import type { PermissionCheckResult, SupportedToolName } from "./src/types.js";
+import { checkCodemodeScript } from "./src/codemode.js";
+import type { CodemodePermissionRule, PermissionCheckResult, SupportedToolName } from "./src/types.js";
 
 const SUPPORTED_TOOLS = new Set<string>(["bash", "read", "edit", "write"] satisfies SupportedToolName[]);
+const CODEMODE_TOOL_NAME = "codemode";
+const CODEMODE_PREVIEW_LIMIT = 1000;
 
 // Deliberately not a "denial": the user stopped the turn, they did not refuse the tool.
 const CANCELLED_BY_ABORT: ToolCallEventResult = {
@@ -158,6 +161,81 @@ function formatUserDeniedReason(result: PermissionCheckResult): string {
   return `User denied ${result.toolName} on '${result.path ?? ""}'. ${hardStop()}`;
 }
 
+function formatCodemodeMatches(matches: readonly CodemodePermissionRule[]): string {
+  return matches
+    .map((rule) => `- ${JSON.stringify(rule.selector)}: ${rule.state} (${rule.layer} config)`)
+    .join("\n");
+}
+
+function escapePreviewControls(code: string): string {
+  return code.replace(/[\u0000-\u001f\u007f]/g, (character) => {
+    if (character === "\n") return "\n";
+    if (character === "\t") return "\\t";
+    return `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`;
+  });
+}
+
+function formatCodemodePreview(code: string): string {
+  const preview = escapePreviewControls(code.slice(0, CODEMODE_PREVIEW_LIMIT));
+  const truncated = code.length > CODEMODE_PREVIEW_LIMIT;
+  return `Script preview${truncated ? ` (truncated to ${CODEMODE_PREVIEW_LIMIT} of ${code.length} characters)` : ""}:\n${preview}`;
+}
+
+async function enforceCodemode(
+  event: ToolCallEvent,
+  ctx: ExtensionContext,
+  policy: RuntimePolicy,
+): Promise<ToolCallEventResult> {
+  const check = checkCodemodeScript(event.input, policy.codemodeRules, policy.codemodeDiagnostics);
+  if (check.kind === "block") {
+    return { block: true, reason: `Codemode is blocked because its permission check failed:\n${check.reason}` };
+  }
+
+  if (check.state === "deny") {
+    return {
+      block: true,
+      reason: `Codemode script denied by policy:\n${formatCodemodeMatches(check.matches)}\n${hardStop()}`,
+    };
+  }
+
+  if (check.state !== "ask") {
+    return {};
+  }
+
+  if (!ctx.hasUI) {
+    return {
+      block: true,
+      reason: `Codemode script requires approval, but no interactive UI is available.\n${formatCodemodeMatches(check.matches)}`,
+    };
+  }
+
+  const code = toRecord(event.input).code;
+  if (typeof code !== "string") {
+    return { block: true, reason: "Codemode script input could not be read for approval." };
+  }
+
+  const signal = ctx.signal;
+  if (signal?.aborted) {
+    return CANCELLED_BY_ABORT;
+  }
+
+  const message = [
+    "Allow this codemode script?",
+    "Matching rules:",
+    formatCodemodeMatches(check.matches),
+    formatCodemodePreview(code),
+  ].join("\n\n");
+  const approved = await ctx.ui.confirm("Codemode Permission Required", message, { signal });
+  if (signal?.aborted) {
+    return CANCELLED_BY_ABORT;
+  }
+  if (!approved) {
+    return { block: true, reason: `User denied codemode script. ${hardStop()}` };
+  }
+
+  return {};
+}
+
 export default function minimalPermissionExtension(pi: ExtensionAPI): void {
   yoloEnabled = false;
 
@@ -183,7 +261,7 @@ export default function minimalPermissionExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", async (event: ToolCallEvent, ctx): Promise<ToolCallEventResult> => {
-    if (!isSupportedToolName(event.toolName)) {
+    if (event.toolName !== CODEMODE_TOOL_NAME && !isSupportedToolName(event.toolName)) {
       return {};
     }
 
@@ -192,6 +270,14 @@ export default function minimalPermissionExtension(pi: ExtensionAPI): void {
     }
 
     const policy = loadPolicy(ctx);
+    if (event.toolName === CODEMODE_TOOL_NAME) {
+      return enforceCodemode(event, ctx, policy);
+    }
+
+    if (!isSupportedToolName(event.toolName)) {
+      return {};
+    }
+
     const result = checkPermission(
       event.toolName,
       event.input,

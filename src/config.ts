@@ -2,15 +2,26 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import esquery from "esquery";
 import { type ParseError as JsoncParseError, parse as parseJsonc, printParseErrorCode } from "jsonc-parser";
 
 import { isPermissionState, toRecord } from "./common.js";
-import type { PermissionConfig, PermissionRule, SupportedToolName, ToolPermissions } from "./types.js";
+import type {
+  CodemodePermissionRule,
+  CodemodePolicyDiagnostic,
+  PermissionConfig,
+  PermissionLayerName,
+  PermissionRule,
+  SupportedToolName,
+  ToolPermissions,
+} from "./types.js";
 
 const SUPPORTED_TOOLS = ["bash", "read", "edit", "write"] as const satisfies readonly SupportedToolName[];
 
 export interface CachedPolicy {
   rules: PermissionRule[];
+  codemodeRules: CodemodePermissionRule[];
+  codemodeDiagnostics: CodemodePolicyDiagnostic[];
   stamp: string;
 }
 
@@ -52,7 +63,7 @@ function normalizeToolPermissions(value: unknown): ToolPermissions {
   return normalized;
 }
 
-export function parsePermissionConfig(raw: string, filePath: string): PermissionConfig {
+function parseJsoncDocument(raw: string, filePath: string): unknown {
   const errors: JsoncParseError[] = [];
   const parsed = parseJsonc(raw, errors, { allowTrailingComma: true });
 
@@ -60,16 +71,93 @@ export function parsePermissionConfig(raw: string, filePath: string): Permission
     throw new Error(`Failed to parse permission config at '${filePath}' (${formatJsoncParseSummary(raw, errors)})`);
   }
 
-  const record = toRecord(parsed);
-  const config: PermissionConfig = {};
+  return parsed;
+}
 
+function normalizeOriginalToolConfig(record: Record<string, unknown>): PermissionConfig {
+  const config: PermissionConfig = {};
   for (const toolName of SUPPORTED_TOOLS) {
     if (record[toolName] !== undefined) {
       config[toolName] = normalizeToolPermissions(record[toolName]);
     }
   }
-
   return config;
+}
+
+export function parsePermissionConfig(raw: string, filePath: string): PermissionConfig {
+  return normalizeOriginalToolConfig(toRecord(parseJsoncDocument(raw, filePath)));
+}
+
+function isConfigObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parsePolicyDocument(
+  raw: string,
+  filePath: string,
+  layer: PermissionLayerName,
+): { config: PermissionConfig; codemodeRules: CodemodePermissionRule[]; diagnostics: CodemodePolicyDiagnostic[] } {
+  const parsed = parseJsoncDocument(raw, filePath);
+  const record = toRecord(parsed);
+  const config = normalizeOriginalToolConfig(record);
+  const codemodeRules: CodemodePermissionRule[] = [];
+  const diagnostics: CodemodePolicyDiagnostic[] = [];
+
+  if (!isConfigObject(parsed)) {
+    diagnostics.push({ configPath: filePath, message: `Permission config at '${filePath}' must have an object at its top level.` });
+    return { config, codemodeRules, diagnostics };
+  }
+
+  if (!Object.hasOwn(record, "codemode")) {
+    return { config, codemodeRules, diagnostics };
+  }
+
+  const codemode = record.codemode;
+  if (!isConfigObject(codemode)) {
+    diagnostics.push({
+      configPath: filePath,
+      message: `The codemode section in '${filePath}' must be an object mapping selectors to permission states.`,
+    });
+    return { config, codemodeRules, diagnostics };
+  }
+
+  for (const [selector, state] of Object.entries(codemode)) {
+    if (!selector.trim()) {
+      diagnostics.push({
+        configPath: filePath,
+        selector,
+        message: `The codemode selector in '${filePath}' must not be empty.`,
+      });
+      continue;
+    }
+    if (!isPermissionState(state)) {
+      diagnostics.push({
+        configPath: filePath,
+        selector,
+        message: `Invalid permission state for codemode selector '${selector}' in '${filePath}'; expected allow, ask, or deny.`,
+      });
+      continue;
+    }
+
+    try {
+      codemodeRules.push({
+        selector,
+        state,
+        layer,
+        configPath: filePath,
+        compiledSelector: esquery.parse(selector),
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      diagnostics.push({
+        configPath: filePath,
+        selector,
+        message: `Invalid codemode selector '${selector}' in '${filePath}': ${detail}`,
+      });
+    }
+  }
+
+  return { config, codemodeRules, diagnostics };
 }
 
 export function loadPermissionConfig(
@@ -131,7 +219,8 @@ export function resolvePermissionRules(
 
 function getFileStamp(path: string): string {
   try {
-    return String(statSync(path).mtimeMs);
+    const stat = statSync(path);
+    return `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}:${stat.ino}`;
   } catch {
     return "missing";
   }
@@ -141,13 +230,53 @@ export function buildPolicyStamp(globalPath: string, projectPath: string | null)
   return `${globalPath}:${getFileStamp(globalPath)}|${projectPath ?? "none"}:${projectPath ? getFileStamp(projectPath) : "none"}`;
 }
 
+function loadPolicyDocument(
+  path: string | null,
+  layer: PermissionLayerName,
+): { config: PermissionConfig | null; codemodeRules: CodemodePermissionRule[]; diagnostics: CodemodePolicyDiagnostic[] } {
+  if (!path) {
+    return { config: null, codemodeRules: [], diagnostics: [] };
+  }
+
+  try {
+    return parsePolicyDocument(readFileSync(path, "utf-8"), path, layer);
+  } catch (error) {
+    if (isNodeErrorWithCode(error, "ENOENT")) {
+      return { config: null, codemodeRules: [], diagnostics: [] };
+    }
+
+    const detail = error instanceof Error ? error.message : String(error);
+    const message = `Failed to load permission config from '${path}': ${detail}`;
+    return {
+      config: null,
+      codemodeRules: [],
+      diagnostics: [{ configPath: path, message }],
+    };
+  }
+}
+
 export function resolveCachedPolicy(
   globalPath: string,
   projectPath: string | null,
   onWarning?: (message: string) => void,
 ): CachedPolicy {
+  const globalPolicy = loadPolicyDocument(globalPath, "global");
+  const projectPolicy = loadPolicyDocument(projectPath, "project");
+  const rules: PermissionRule[] = [];
+  const codemodeRules = [...globalPolicy.codemodeRules, ...projectPolicy.codemodeRules];
+  const codemodeDiagnostics = [...globalPolicy.diagnostics, ...projectPolicy.diagnostics];
+
+  pushRules(rules, "global", globalPolicy.config);
+  pushRules(rules, "project", projectPolicy.config);
+
+  for (const diagnostic of codemodeDiagnostics) {
+    onWarning?.(diagnostic.message);
+  }
+
   return {
-    rules: resolvePermissionRules(globalPath, projectPath, onWarning),
+    rules,
+    codemodeRules,
+    codemodeDiagnostics,
     stamp: buildPolicyStamp(globalPath, projectPath),
   };
 }
