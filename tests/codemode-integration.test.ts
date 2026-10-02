@@ -177,6 +177,44 @@ await test("the real codemode pipeline blocks a script before its nested write e
   });
 });
 
+await test("syntax denies prevent direct eval inside dynamic-import options from executing", async () => {
+  const marker = "import-options-executed";
+  const code = `try {
+    await import("missing", { with: { type: eval('text("${marker}"); "json"') } });
+  } catch {}`;
+
+  await withPiCodemodeSession({ code }, async ({ session }) => {
+    assert.match(codemodeResultText(session), /^Script completed\n/);
+    assert.match(codemodeResultText(session), new RegExp(marker));
+  });
+
+  await withPiCodemodeSession({
+    code,
+    projectConfig: JSON.stringify({ codemode: { "CallExpression[callee.name='eval']": "deny" } }),
+  }, async ({ session, nestedCalls }) => {
+    assert.match(codemodeResultText(session), /Codemode script denied by policy/);
+    assert.doesNotMatch(codemodeResultText(session), new RegExp(marker));
+    assert.deepEqual(nestedCalls, []);
+  });
+});
+
+await test("invalid global pseudo-classes block every script despite a project allow", async () => {
+  await withPiCodemodeSession({
+    code: ["return 1;", "const a = 1; return a;"],
+    globalConfig: '{"codemode":{"Identifier:unknown":"deny"}}',
+    projectConfig: '{"codemode":{"Program":"allow"}}',
+  }, async ({ session, nestedCalls }) => {
+    const results = codemodeResultTexts(session);
+    assert.equal(results.length, 2);
+    for (const result of results) {
+      assert.match(result, /Invalid codemode selector 'Identifier:unknown'/);
+      assert.match(result, /Unknown class name: unknown/);
+      assert.doesNotMatch(result, /^Script completed\n/);
+    }
+    assert.deepEqual(nestedCalls, []);
+  });
+});
+
 await test("Pi's codemode runtime accepts supported script-body syntax under Program allow", async () => {
   const codes = [
     ";",

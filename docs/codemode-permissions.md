@@ -35,6 +35,9 @@ Selectors support:
 - Multiple attributes on one selector to require all of them, as in `[callee.type='MemberExpression'][callee.computed=false]`.
 - Comma-separated selectors to match any listed node type, as in the loop rule above.
 - CSS-like relationships and pseudo-classes supported by esquery, including descendant, child, `:not(...)`, and `:has(...)` selectors.
+- Case-insensitive node-category pseudo-classes: `:statement`, `:declaration`, `:pattern`, `:expression`, and `:function`.
+
+Unknown node-category pseudo-classes invalidate the policy when it loads, including inside combined or nested selectors. This blocks codemode even when no script node would match the invalid selector.
 
 Selector strings are JSONC strings. Single quotes inside a selector avoid additional escaping. If a selector needs double quotes, escape them for JSONC. This rule matches string literals whose value is `secret`:
 
@@ -45,6 +48,8 @@ Selector strings are JSONC strings. Single quotes inside a selector avoid additi
   }
 }
 ```
+
+Matching inspects executable expressions in both arguments of dynamic `import(...)`, including the options argument.
 
 The parser and selectors work on syntax, not source text. A comment or string containing `eval("x")` is not a `CallExpression`. The direct-call selector `CallExpression[callee.name='eval']` matches `eval("x")`; it does not resolve aliases such as `const run = eval; run("x")`, nor computed access such as `globalThis["eval"]("x")`.
 

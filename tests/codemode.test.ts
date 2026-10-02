@@ -187,19 +187,21 @@ test("invalid codemode sections, states, top-level shapes, malformed JSONC, and 
 test("invalid codemode policy does not discard valid bash and read rules", () => {
   withTempDir((dir) => {
     const path = join(dir, "permissions.jsonc");
-    writeConfig(path, JSON.stringify({
-      bash: { "^echo": "allow" },
-      read: { "**": "deny" },
-      codemode: { Program: "invalid" },
-    }));
+    for (const codemode of [{ Program: "invalid" }, { "Identifier:unknown": "deny" }]) {
+      writeConfig(path, JSON.stringify({
+        bash: { "^echo": "allow" },
+        read: { "**": "deny" },
+        codemode,
+      }));
 
-    const policy = resolveCachedPolicy(path, null);
+      const policy = resolveCachedPolicy(path, null);
 
-    assert.deepEqual(policy.rules, [
-      { toolName: "bash", pattern: "^echo", state: "allow", layer: "global" },
-      { toolName: "read", pattern: "**", state: "deny", layer: "global" },
-    ]);
-    assert.ok(policy.codemodeDiagnostics.length > 0);
+      assert.deepEqual(policy.rules, [
+        { toolName: "bash", pattern: "^echo", state: "allow", layer: "global" },
+        { toolName: "read", pattern: "**", state: "deny", layer: "global" },
+      ]);
+      assert.ok(policy.codemodeDiagnostics.length > 0);
+    }
   });
 });
 
@@ -253,6 +255,30 @@ test("direct-call selectors do not resolve aliases or computed access", () => {
   });
 });
 
+test("direct-call and parent selectors inspect executable dynamic-import options", () => {
+  withTempDir((dir) => {
+    const path = join(dir, "permissions.jsonc");
+    const code = 'await import("missing", { with: { type: eval("json") } });';
+    for (const [selector, state] of [
+      ["CallExpression[callee.name='eval']", "deny"],
+      ["ImportExpression:has(CallExpression[callee.name='eval'])", "deny"],
+      ["ImportExpression > ObjectExpression", "ask"],
+    ] as const) {
+      writeConfig(path, JSON.stringify({ codemode: { [selector]: state } }));
+      const policy = resolveCachedPolicy(path, null);
+      const result = checkCodemodeScript({ code }, policy.codemodeRules, policy.codemodeDiagnostics);
+      assert.equal(result.kind, "decision");
+      if (result.kind === "decision") {
+        assert.equal(result.state, state);
+        assert.deepEqual(result.matches.map((rule) => rule.selector), [selector]);
+      }
+      assert.deepEqual(checkCodemodeScript(
+        { code: 'await import("missing");' }, policy.codemodeRules, policy.codemodeDiagnostics,
+      ), { kind: "decision", state: "allow", matches: [] });
+    }
+  });
+});
+
 test("Program selectors match the submitted root without a synthetic function node", () => {
   withTempDir((dir) => {
     const path = join(dir, "permissions.jsonc");
@@ -275,20 +301,74 @@ test("Program selectors match the submitted root without a synthetic function no
   });
 });
 
-test("selector-evaluation failures identify the configured selector and file", () => {
+test("unknown pseudo-classes invalidate policy even when no script node would match", () => {
   withTempDir((dir) => {
     const path = join(dir, "permissions.jsonc");
-    writeConfig(path, '{"codemode":{"Program:unknown":"deny"}}');
+    const selector = "Identifier:unknown";
+    writeConfig(path, JSON.stringify({ codemode: { [selector]: "deny" } }));
     const policy = resolveCachedPolicy(path, null);
 
-    assert.deepEqual(policy.codemodeDiagnostics, []);
-    assert.equal(policy.codemodeRules[0]?.selector, "Program:unknown");
-    const result = checkCodemodeScript({ code: "return 1;" }, policy.codemodeRules, policy.codemodeDiagnostics);
+    assert.equal(policy.codemodeDiagnostics.length, 1);
+    assert.equal(policy.codemodeDiagnostics[0]!.configPath, path);
+    assert.equal(policy.codemodeDiagnostics[0]!.selector, selector);
+    assert.match(policy.codemodeDiagnostics[0]!.message, /Unknown class name: unknown/);
 
-    assert.equal(result.kind, "block");
-    if (result.kind === "block") {
-      assert.match(result.reason, /Program:unknown/);
-      assert.match(result.reason, /permissions\.jsonc/);
+    for (const input of [{ code: "return 1;" }, { code: "const a = 1;" }, {}]) {
+      const result = checkCodemodeScript(input, policy.codemodeRules, policy.codemodeDiagnostics);
+      assert.equal(result.kind, "block");
+      if (result.kind === "block") {
+        assert.match(result.reason, /Identifier:unknown/);
+        assert.match(result.reason, /permissions\.jsonc/);
+      }
+    }
+  });
+});
+
+test("unknown pseudo-classes are rejected inside nested and combined selectors", () => {
+  withTempDir((dir) => {
+    const path = join(dir, "permissions.jsonc");
+    for (const selector of [
+      "Program:unknown",
+      "Program:has(Identifier:unknown)",
+      "Program:not(Identifier:unknown)",
+      "Program:matches(Identifier:unknown, Literal)",
+      "Program > Identifier:unknown",
+      "Identifier:unknown Program",
+      "Identifier:unknown + Literal",
+      "Literal ~ Identifier:unknown",
+      "Identifier:unknown, Program",
+    ]) {
+      writeConfig(path, JSON.stringify({ codemode: { [selector]: "allow" } }));
+      const policy = resolveCachedPolicy(path, null);
+      assert.equal(policy.codemodeDiagnostics.length, 1, selector);
+      assert.equal(policy.codemodeDiagnostics[0]!.selector, selector);
+      assert.match(policy.codemodeDiagnostics[0]!.message, /Unknown class name: unknown/);
+      assert.equal(checkCodemodeScript(
+        { code: "return 1;" }, policy.codemodeRules, policy.codemodeDiagnostics,
+      ).kind, "block");
+    }
+  });
+});
+
+test("supported pseudo-classes remain valid and match their syntax", () => {
+  withTempDir((dir) => {
+    const path = join(dir, "permissions.jsonc");
+    for (const [selector, code] of [
+      [":statement", "return 1;"],
+      [":declaration", "const value = 1;"],
+      [":pattern", "const [value] = [1];"],
+      [":expression", "1;"],
+      [":function", "() => 1;"],
+      [":FUNCTION", "() => 1;"],
+      ["Program:has(:expression)", "1;"],
+      ["Literal[value=':unknown']", "':unknown';"],
+    ]) {
+      writeConfig(path, JSON.stringify({ codemode: { [selector]: "deny" } }));
+      const policy = resolveCachedPolicy(path, null);
+      assert.deepEqual(policy.codemodeDiagnostics, [], selector);
+      const result = checkCodemodeScript({ code }, policy.codemodeRules, policy.codemodeDiagnostics);
+      assert.equal(result.kind, "decision");
+      if (result.kind === "decision") assert.equal(result.state, "deny", selector);
     }
   });
 });

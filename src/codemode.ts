@@ -6,6 +6,13 @@ import type { CodemodePermissionRule, CodemodePolicyDiagnostic, PermissionState 
 
 type EsqueryNode = Parameters<typeof esquery.match>[0];
 
+const MATCH_OPTIONS = {
+  visitorKeys: {
+    // Dynamic-import options can contain executable syntax and must be traversed.
+    ImportExpression: ["source", "options"],
+  },
+} satisfies esquery.ESQueryOptions;
+
 export type CodemodeCheckResult =
   | { kind: "block"; reason: string }
   | { kind: "decision"; state: PermissionState; matches: CodemodePermissionRule[] };
@@ -67,7 +74,7 @@ export function checkCodemodeScript(
   const matches: CodemodePermissionRule[] = [];
   for (const rule of rules) {
     try {
-      if (esquery.match(asEsqueryNode(ast), rule.compiledSelector).length > 0) {
+      if (esquery.match(asEsqueryNode(ast), rule.compiledSelector, MATCH_OPTIONS).length > 0) {
         matches.push(rule);
       }
     } catch (error) {

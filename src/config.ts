@@ -17,6 +17,7 @@ import type {
 } from "./types.js";
 
 const SUPPORTED_TOOLS = ["bash", "read", "edit", "write"] as const satisfies readonly SupportedToolName[];
+const SUPPORTED_SELECTOR_CLASSES = new Set(["statement", "declaration", "pattern", "expression", "function"]);
 
 export interface CachedPolicy {
   rules: PermissionRule[];
@@ -92,6 +93,24 @@ function isConfigObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function validateSelectorClasses(value: unknown): void {
+  const node = toRecord(value);
+  if (node.type === "class") {
+    const name = node.name;
+    if (typeof name !== "string" || !SUPPORTED_SELECTOR_CLASSES.has(name.toLowerCase())) {
+      throw new Error(`Unknown class name: ${String(name)}`);
+    }
+  }
+
+  for (const child of Object.values(node)) {
+    if (Array.isArray(child)) {
+      child.forEach(validateSelectorClasses);
+    } else if (child !== null && typeof child === "object") {
+      validateSelectorClasses(child);
+    }
+  }
+}
+
 function parsePolicyDocument(
   raw: string,
   filePath: string,
@@ -140,12 +159,14 @@ function parsePolicyDocument(
     }
 
     try {
+      const compiledSelector = esquery.parse(selector);
+      validateSelectorClasses(compiledSelector);
       codemodeRules.push({
         selector,
         state,
         layer,
         configPath: filePath,
-        compiledSelector: esquery.parse(selector),
+        compiledSelector,
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
