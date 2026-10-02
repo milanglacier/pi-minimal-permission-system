@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -13,7 +13,8 @@ type ToolFixture =
   | Pick<ReadToolCallEvent, "toolName" | "input">
   | Pick<EditToolCallEvent, "toolName" | "input">
   | Pick<WriteToolCallEvent, "toolName" | "input">
-  | Pick<GrepToolCallEvent, "toolName" | "input">;
+  | Pick<GrepToolCallEvent, "toolName" | "input">
+  | { toolName: "codemode"; input: Record<string, unknown> };
 
 import minimalPermissionExtension from "../index.js";
 import { getGlobalConfigPath, parsePermissionConfig, resolvePermissionRules } from "../src/config.js";
@@ -634,6 +635,268 @@ await runTest("tool_call blocks ask when no UI is available", async () => {
     assert.equal(harness.prompts.length, 0);
   } finally {
     harness.cleanup();
+  }
+});
+
+await runTest("codemode allows by default when no codemode rules are configured", async () => {
+  const harness = await createHarness(null, null);
+  try {
+    assert.deepEqual(await runToolCall(harness, { toolName: "codemode", input: {} }), {});
+    assert.equal(harness.prompts.length, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("codemode deny rules block before execution and identify their selector and layer", async () => {
+  const harness = await createHarness('{"codemode":{"DebuggerStatement":"deny"}}', null);
+  try {
+    const result = await runToolCall(harness, { toolName: "codemode", input: { code: "debugger;" } });
+    assert.equal(result.block, true);
+    assert.match(String(result.reason), /DebuggerStatement/);
+    assert.match(String(result.reason), /global config/);
+    assert.match(String(result.reason), /Hard stop/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("repeated approved codemode scripts each require a fresh confirmation", async () => {
+  const harness = await createHarness('{"codemode":{"Program":"ask"}}', null);
+  const script = { toolName: "codemode" as const, input: { code: "return 1;" } };
+  try {
+    assert.deepEqual(await runToolCall(harness, script, { hasUI: true, confirm: async () => true }), {});
+    assert.deepEqual(await runToolCall(harness, script, { hasUI: true, confirm: async () => true }), {});
+    assert.equal(harness.prompts.length, 2);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("codemode ask prompts once with rule details and a bounded script preview", async () => {
+  const harness = await createHarness('{"codemode":{"Program":"ask"}}', null);
+  const code = `return 42;\n${"// preview\n".repeat(150)}`;
+  try {
+    const result = await runToolCall(
+      harness,
+      { toolName: "codemode", input: { code } },
+      { hasUI: true },
+    );
+    assert.deepEqual(result, {});
+    assert.equal(harness.prompts.length, 1);
+    assert.match(harness.prompts[0]!, /Matching rules/);
+    assert.match(harness.prompts[0]!, /Program.*ask.*global config/);
+    assert.match(harness.prompts[0]!, /Script preview \(truncated to 1000 of/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("refusing codemode approval returns an explicit denial", async () => {
+  const harness = await createHarness('{"codemode":{"Program":"ask"}}', null);
+  try {
+    const result = await runToolCall(
+      harness,
+      { toolName: "codemode", input: { code: "return 1;" } },
+      { hasUI: true, confirm: async () => false },
+    );
+    assert.equal(result.block, true);
+    assert.match(String(result.reason), /User denied codemode script/);
+    assert.match(String(result.reason), /Hard stop/);
+    assert.doesNotMatch(String(result.reason), /cancelled|aborted/i);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("cancellation wins when codemode approval races with an abort", async () => {
+  const harness = await createHarness('{"codemode":{"Program":"ask"}}', null);
+  const controller = new AbortController();
+  const dialog = createDeferredConfirm();
+  const pending = runToolCall(
+    harness,
+    { toolName: "codemode", input: { code: "return 1;" } },
+    { hasUI: true, signal: controller.signal, confirm: dialog.confirm },
+  );
+  try {
+    await within(dialog.started, "codemode confirmation to open");
+    dialog.reply(true);
+    controller.abort();
+    const result = await within(pending, "racing codemode request to settle");
+    assert.equal(result.block, true);
+    assert.match(String(result.reason), /cancelled.*aborted/i);
+  } finally {
+    await cleanupPendingConfirmation(harness, dialog, pending);
+  }
+});
+
+await runTest("codemode approval previews escape terminal control characters", async () => {
+  const harness = await createHarness('{"codemode":{"Program":"ask"}}', null);
+  const code = `// ${String.fromCharCode(27)}[31m\nreturn 1;`;
+  try {
+    const result = await runToolCall(
+      harness,
+      { toolName: "codemode", input: { code } },
+      { hasUI: true },
+    );
+    assert.deepEqual(result, {});
+    assert.doesNotMatch(harness.prompts[0]!, /\u001b/);
+    assert.match(harness.prompts[0]!, /\\u001b\[31m/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("a pre-aborted codemode ask does not prompt", async () => {
+  const harness = await createHarness('{"codemode":{"Program":"ask"}}', null);
+  const controller = new AbortController();
+  controller.abort();
+  try {
+    const result = await runToolCall(
+      harness,
+      { toolName: "codemode", input: { code: "return 1;" } },
+      { hasUI: true, signal: controller.signal },
+    );
+    assert.equal(result.block, true);
+    assert.match(String(result.reason), /cancelled.*aborted/i);
+    assert.equal(harness.prompts.length, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("codemode ask fails closed when no interactive UI is available", async () => {
+  const harness = await createHarness('{"codemode":{"Program":"ask"}}', null);
+  try {
+    const result = await runToolCall(harness, { toolName: "codemode", input: { code: "return 1;" } });
+    assert.equal(result.block, true);
+    assert.match(String(result.reason), /requires approval.*no interactive UI/i);
+    assert.equal(harness.prompts.length, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("codemode policy cache recovers after a config is fixed or removed", async () => {
+  const harness = await createHarness('{"codemode":{"DebuggerStatement":"invalid"}}', null);
+  const configPath = getHomeConfigPath(harness.home);
+  const script = { toolName: "codemode" as const, input: { code: "debugger;" } };
+  try {
+    assert.equal((await runToolCall(harness, script)).block, true);
+
+    writeJsonc(configPath, '{"codemode":{"DebuggerStatement":"allow"}}');
+    assert.deepEqual(await runToolCall(harness, script), {});
+
+    writeJsonc(configPath, '{"codemode":{"DebuggerStatement":"deny"}}');
+    assert.equal((await runToolCall(harness, script)).block, true);
+
+    rmSync(configPath);
+    assert.deepEqual(await runToolCall(harness, script), {});
+
+    mkdirSync(configPath);
+    assert.equal((await runToolCall(harness, script)).block, true);
+    rmSync(configPath, { recursive: true });
+    assert.deepEqual(await runToolCall(harness, script), {});
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("atomic config replacement invalidates cache with unchanged mtime and size", async () => {
+  const harness = await createHarness('{"codemode":{"DebuggerStatement":"deny"}}', null);
+  const configPath = getHomeConfigPath(harness.home);
+  const replacementPath = `${configPath}.replacement`;
+  const script = { toolName: "codemode" as const, input: { code: "debugger;" } };
+  try {
+    const fixedTime = new Date("2020-01-01T00:00:00.000Z");
+    utimesSync(configPath, fixedTime, fixedTime);
+    assert.equal((await runToolCall(harness, script)).block, true);
+    const originalStat = statSync(configPath);
+    writeJsonc(replacementPath, '{"codemode":{"DebuggerStatement":"ask" }}');
+    utimesSync(replacementPath, originalStat.atime, originalStat.mtime);
+    assert.equal(statSync(replacementPath).size, originalStat.size);
+    assert.equal(statSync(replacementPath).mtimeMs, originalStat.mtimeMs);
+
+    renameSync(replacementPath, configPath);
+    assert.deepEqual(
+      await runToolCall(harness, script, { hasUI: true, confirm: async () => true }),
+      {},
+    );
+    assert.equal(harness.prompts.length, 1);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("YOLO bypasses codemode policy validation and prompts", async () => {
+  const harness = await createHarness('{"codemode":{"DebuggerStatement":"invalid"}}', null, { yoloFlag: true });
+  try {
+    assert.deepEqual(await runToolCall(harness, {
+      toolName: "codemode",
+      input: { code: "debugger;" },
+    }), {});
+    assert.equal(harness.prompts.length, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("toggling YOLO restores codemode enforcement when disabled again", async () => {
+  const harness = await createHarness('{"codemode":{"DebuggerStatement":"deny"}}', null);
+  const script = { toolName: "codemode" as const, input: { code: "debugger;" } };
+  try {
+    assert.equal((await runToolCall(harness, script)).block, true);
+    await runSlashCommand(harness, "yolo");
+    assert.deepEqual(await runToolCall(harness, script), {});
+    await runSlashCommand(harness, "yolo");
+    assert.equal((await runToolCall(harness, script)).block, true);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("changing cwd reloads project codemode policy", async () => {
+  const harness = await createHarness(null, '{"codemode":{"DebuggerStatement":"allow"}}');
+  const otherCwd = join(harness.cwd, "other-project");
+  mkdirSync(otherCwd, { recursive: true });
+  writeJsonc(getProjectConfigPath(otherCwd), '{"codemode":{"DebuggerStatement":"deny"}}');
+  const event = {
+    type: "tool_call" as const,
+    toolCallId: "cwd-change",
+    toolName: "codemode" as const,
+    input: { code: "debugger;" },
+  };
+  try {
+    assert.deepEqual(await runToolCall(harness, event), {});
+    const result = await harness.toolCallHandler(
+      event,
+      createMockContext(otherCwd, harness.prompts, harness.warnings),
+    );
+    assert.equal(result?.block, true);
+    assert.match(String(result?.reason), /project config/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("aborting a codemode approval blocks execution with cancellation rather than denial", async () => {
+  const harness = await createHarness('{"codemode":{"Program":"ask"}}', null);
+  const controller = new AbortController();
+  const dialog = createDeferredConfirm();
+  const pending = runToolCall(
+    harness,
+    { toolName: "codemode", input: { code: "return 1;" } },
+    { hasUI: true, signal: controller.signal, confirm: dialog.confirm },
+  );
+  try {
+    await within(dialog.started, "codemode confirmation to open");
+    controller.abort();
+    const result = await within(pending, "codemode permission request to cancel");
+    assert.equal(result.block, true);
+    assert.match(String(result.reason), /cancelled.*aborted/i);
+    assert.doesNotMatch(String(result.reason), /User denied|Hard stop/i);
+  } finally {
+    await cleanupPendingConfirmation(harness, dialog, pending);
   }
 });
 
