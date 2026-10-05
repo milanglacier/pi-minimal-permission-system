@@ -338,6 +338,93 @@ for (const event of askToolCalls) {
   });
 }
 
+for (const event of askToolCalls) {
+  for (const outcome of ["deny", "refused", "no UI"] as const) {
+    await runTest(`${event.toolName} ${outcome} explains the effective rule and blocking cause`, async () => {
+      const pattern = event.toolName === "bash" ? "printf .*" : "**/*.txt";
+      const state = outcome === "deny" ? "deny" : "ask";
+      const harness = await createHarness(JSON.stringify({ [event.toolName]: { [pattern]: state } }), null);
+      try {
+        const result = await runToolCall(harness, event, {
+          hasUI: outcome === "refused", confirm: async () => false,
+        });
+        const reason = String(result.reason);
+        const summary = `Effective policy: ${event.toolName}[${JSON.stringify(pattern)}] = ${state}`;
+        assert.equal(result.block, true);
+        assert.ok(reason.includes(summary));
+        assert.doesNotMatch(reason, /global config|project config/);
+        if (outcome === "no UI") {
+          assert.match(reason, /requires approval, but no interactive UI is available/);
+          assert.match(reason, /non-interactive session cannot present the approval request for user review or approval/);
+          assert.match(reason, /operation is blocked/);
+          assert.doesNotMatch(reason, /User denied|denied by policy|Hard stop/);
+        } else {
+          assert.match(reason, outcome === "deny" ? /Permission denied.*policy/ : /User denied/);
+          assert.match(reason, /Hard stop/);
+        }
+        if (outcome === "refused") {
+          assert.ok(harness.prompts[0]!.includes(summary));
+          assert.doesNotMatch(harness.prompts[0]!, /global config|project config/);
+        }
+      } finally {
+        harness.cleanup();
+      }
+    });
+  }
+}
+
+for (const event of askToolCalls.slice(0, 2)) {
+  for (const hasUI of [true, false]) {
+    await runTest(`unmatched ${event.toolName} ${hasUI ? "refusal" : "without UI"} explains built-in default ask`, async () => {
+      const harness = await createHarness(null, null);
+      try {
+        const result = await runToolCall(harness, event, { hasUI, confirm: async () => false });
+        assert.equal(result.block, true);
+        assert.ok(String(result.reason).includes("Effective policy: built-in default ask (no matching rule)."));
+        if (hasUI) {
+          assert.ok(harness.prompts[0]!.includes("Effective policy: built-in default ask (no matching rule)."));
+        }
+      } finally {
+        harness.cleanup();
+      }
+    });
+  }
+}
+
+for (const protectDeny of [false, true]) {
+  await runTest(`${protectDeny ? "protected deny" : "project override"} reports only the effective rule`, async () => {
+    const harness = await createHarness(
+      JSON.stringify({ bash: { "printf .*": protectDeny ? "deny" : "allow" } }),
+      JSON.stringify({ bash: { "printf permission-test": "ask" } }),
+    );
+    try {
+      const result = await runToolCall(harness, askToolCalls[0]!);
+      const summary = String(result.reason).split("\n").find((line) => line.startsWith("Effective policy:"));
+      assert.equal(summary, protectDeny
+        ? 'Effective policy: bash["printf .*"] = deny'
+        : 'Effective policy: bash["printf permission-test"] = ask');
+    } finally {
+      harness.cleanup();
+    }
+  });
+}
+
+await runTest("rule patterns use JSON escaping in approval prompts and rejection details", async () => {
+  const pattern = 'printf|"quoted"\n\u001b';
+  const harness = await createHarness(JSON.stringify({ bash: { [pattern]: "ask" } }), null);
+  try {
+    const result = await runToolCall(harness, askToolCalls[0]!, { hasUI: true, confirm: async () => false });
+    const summary = `Effective policy: bash[${JSON.stringify(pattern)}] = ask`;
+    for (const message of [String(result.reason), harness.prompts[0]!]) {
+      assert.ok(message.includes(summary));
+      assert.doesNotMatch(message, /\u001b/);
+      assert.ok(message.includes('\\"quoted\\"\\n\\u001b'));
+    }
+  } finally {
+    harness.cleanup();
+  }
+});
+
 await runTest("cancellation wins when approval resolves just before the permission handler resumes", async () => {
   const harness = await createHarness(null, null);
   const controller = new AbortController();
@@ -589,6 +676,8 @@ await runTest("tool_call blocks deny and passes unsupported tools through", asyn
 
     assert.equal(denied.block, true);
     assert.match(String(denied.reason), /rm -rf build/);
+    assert.ok(String(denied.reason).includes('Effective policy: bash["rm -rf .*"] = deny'));
+    assert.doesNotMatch(String(denied.reason), /global config|project config/);
     assert.match(String(denied.reason), /Hard stop/);
     assert.deepEqual(unsupported, {});
   } finally {
@@ -648,13 +737,14 @@ await runTest("codemode allows by default when no codemode rules are configured"
   }
 });
 
-await runTest("codemode deny rules block before execution and identify their selector and layer", async () => {
+await runTest("codemode deny rules block before execution and identify their decisive selector", async () => {
   const harness = await createHarness('{"codemode":{"DebuggerStatement":"deny"}}', null);
   try {
     const result = await runToolCall(harness, { toolName: "codemode", input: { code: "debugger;" } });
     assert.equal(result.block, true);
-    assert.match(String(result.reason), /DebuggerStatement/);
-    assert.match(String(result.reason), /global config/);
+    assert.match(String(result.reason), /Effective codemode policy: deny/);
+    assert.ok(String(result.reason).includes('- Decisive rule: selector["DebuggerStatement"] = deny'));
+    assert.doesNotMatch(String(result.reason), /global config|project config/);
     assert.match(String(result.reason), /Hard stop/);
   } finally {
     harness.cleanup();
@@ -684,8 +774,9 @@ await runTest("codemode ask prompts once with rule details and a bounded script 
     );
     assert.deepEqual(result, {});
     assert.equal(harness.prompts.length, 1);
-    assert.match(harness.prompts[0]!, /Matching rules/);
-    assert.match(harness.prompts[0]!, /Program.*ask.*global config/);
+    assert.match(harness.prompts[0]!, /Effective codemode policy: ask/);
+    assert.ok(harness.prompts[0]!.includes('- Decisive rule: selector["Program"] = ask'));
+    assert.doesNotMatch(harness.prompts[0]!, /global config|project config/);
     assert.match(harness.prompts[0]!, /Script preview \(truncated to 1000 of/);
   } finally {
     harness.cleanup();
@@ -702,6 +793,9 @@ await runTest("refusing codemode approval returns an explicit denial", async () 
     );
     assert.equal(result.block, true);
     assert.match(String(result.reason), /User denied codemode script/);
+    assert.match(String(result.reason), /Effective codemode policy: ask/);
+    assert.ok(String(result.reason).includes('- Decisive rule: selector["Program"] = ask'));
+    assert.doesNotMatch(String(result.reason), /global config|project config/);
     assert.match(String(result.reason), /Hard stop/);
     assert.doesNotMatch(String(result.reason), /cancelled|aborted/i);
   } finally {
@@ -771,7 +865,63 @@ await runTest("codemode ask fails closed when no interactive UI is available", a
     const result = await runToolCall(harness, { toolName: "codemode", input: { code: "return 1;" } });
     assert.equal(result.block, true);
     assert.match(String(result.reason), /requires approval.*no interactive UI/i);
+    assert.match(String(result.reason), /non-interactive session cannot present the approval request for user review or approval/);
+    assert.match(String(result.reason), /operation is blocked/);
+    assert.match(String(result.reason), /Effective codemode policy: ask/);
+    assert.ok(String(result.reason).includes('- Decisive rule: selector["Program"] = ask'));
+    assert.doesNotMatch(String(result.reason), /global config|project config|User denied|denied by policy|Hard stop/);
     assert.equal(harness.prompts.length, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+for (const state of ["ask", "deny"] as const) {
+  await runTest(`codemode ${state} distinguishes decisive matches from context across layers`, async () => {
+    const harness = await createHarness(
+      '{"codemode":{"Program":"allow","DebuggerStatement":"ask"}}',
+      JSON.stringify({ codemode: { ReturnStatement: state } }),
+    );
+    try {
+      const result = await runToolCall(
+        harness,
+        { toolName: "codemode", input: { code: "debugger; return 1;" } },
+        { hasUI: true, confirm: async () => false },
+      );
+      assert.equal(result.block, true);
+      const reason = String(result.reason);
+      const summary = [
+        `Effective codemode policy: ${state}`,
+        '- Context rule: selector["Program"] = allow',
+        `- ${state === "ask" ? "Decisive" : "Context"} rule: selector["DebuggerStatement"] = ask`,
+        `- Decisive rule: selector["ReturnStatement"] = ${state}`,
+      ].join("\n");
+      assert.ok(reason.includes(summary));
+      assert.doesNotMatch(reason, /global config|project config/);
+      if (state === "ask") assert.ok(harness.prompts[0]!.includes(summary));
+    } finally {
+      harness.cleanup();
+    }
+  });
+}
+
+await runTest("codemode selectors use JSON escaping in approval prompts and rejection details", async () => {
+  const selector = `Program,\n Identifier[name='"\u001b']`;
+  const harness = await createHarness(JSON.stringify({ codemode: { [selector]: "ask" } }), null);
+  try {
+    const result = await runToolCall(
+      harness,
+      { toolName: "codemode", input: { code: "return 1;" } },
+      { hasUI: true, confirm: async () => false },
+    );
+    assert.equal(result.block, true);
+    const summary = `- Decisive rule: selector[${JSON.stringify(selector)}] = ask`;
+    for (const message of [String(result.reason), harness.prompts[0]!]) {
+      assert.ok(message.includes(summary));
+      assert.doesNotMatch(message, /\u001b/);
+      assert.ok(message.includes("\\n"));
+      assert.ok(message.includes('\\"\\u001b'));
+    }
   } finally {
     harness.cleanup();
   }
@@ -873,7 +1023,8 @@ await runTest("changing cwd reloads project codemode policy", async () => {
       createMockContext(otherCwd, harness.prompts, harness.warnings),
     );
     assert.equal(result?.block, true);
-    assert.match(String(result?.reason), /project config/);
+    assert.ok(String(result?.reason).includes('- Decisive rule: selector["DebuggerStatement"] = deny'));
+    assert.doesNotMatch(String(result?.reason), /global config|project config/);
   } finally {
     harness.cleanup();
   }

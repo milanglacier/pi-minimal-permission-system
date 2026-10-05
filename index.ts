@@ -15,7 +15,7 @@ import {
 } from "./src/config.js";
 import { compileRules, findLastGlobalMatch, findLastMatch, type CompiledRule, type RuleMatch } from "./src/matcher.js";
 import { checkCodemodeScript } from "./src/codemode.js";
-import type { CodemodePermissionRule, PermissionCheckResult, SupportedToolName } from "./src/types.js";
+import type { CodemodePermissionRule, PermissionCheckResult, PermissionState, SupportedToolName } from "./src/types.js";
 
 const SUPPORTED_TOOLS = new Set<string>(["bash", "read", "edit", "write"] satisfies SupportedToolName[]);
 const CODEMODE_TOOL_NAME = "codemode";
@@ -116,13 +116,12 @@ function checkPermission(
   };
 }
 
-function formatMatchSuffix(result: PermissionCheckResult): string {
-  if (!result.matchedPattern) {
-    return "";
+function formatPolicySummary(result: PermissionCheckResult): string {
+  if (result.matchedPattern === undefined) {
+    return "Effective policy: built-in default ask (no matching rule).";
   }
 
-  const layer = result.matchedLayer ? ` from ${result.matchedLayer} config` : "";
-  return ` (matched '${result.matchedPattern}'${layer})`;
+  return `Effective policy: ${result.toolName}[${JSON.stringify(result.matchedPattern)}] = ${result.state}`;
 }
 
 function hardStop(): string {
@@ -131,40 +130,45 @@ function hardStop(): string {
 
 function formatDenyReason(result: PermissionCheckResult): string {
   if (result.toolName === "bash") {
-    return `Permission denied for bash command '${result.command ?? ""}'${formatMatchSuffix(result)}. ${hardStop()}`;
+    return `Permission denied for bash command '${result.command ?? ""}' by policy.\n${formatPolicySummary(result)}\n${hardStop()}`;
   }
 
-  return `Permission denied for ${result.toolName} on '${result.path ?? ""}'${formatMatchSuffix(result)}. ${hardStop()}`;
+  return `Permission denied for ${result.toolName} on '${result.path ?? ""}' by policy.\n${formatPolicySummary(result)}\n${hardStop()}`;
 }
 
 function formatAskPrompt(result: PermissionCheckResult): string {
   if (result.toolName === "bash") {
-    return `Allow bash command '${result.command ?? ""}'${formatMatchSuffix(result)}?`;
+    return `Allow bash command '${result.command ?? ""}'?\n${formatPolicySummary(result)}`;
   }
 
-  return `Allow ${result.toolName} on '${result.path ?? ""}'${formatMatchSuffix(result)}?`;
+  return `Allow ${result.toolName} on '${result.path ?? ""}'?\n${formatPolicySummary(result)}`;
+}
+
+function unavailableExplanation(): string {
+  return "This non-interactive session cannot present the approval request for user review or approval. The operation is blocked.";
 }
 
 function formatUnavailableReason(result: PermissionCheckResult): string {
-  if (result.toolName === "bash") {
-    return `Bash command '${result.command ?? ""}' requires approval, but no interactive UI is available.`;
-  }
-
-  return `${result.toolName} on '${result.path ?? ""}' requires approval, but no interactive UI is available.`;
+  const target = result.toolName === "bash"
+    ? `Bash command '${result.command ?? ""}'`
+    : `${result.toolName} on '${result.path ?? ""}'`;
+  return `${target} requires approval, but no interactive UI is available.\n${unavailableExplanation()}\n${formatPolicySummary(result)}`;
 }
 
 function formatUserDeniedReason(result: PermissionCheckResult): string {
   if (result.toolName === "bash") {
-    return `User denied bash command '${result.command ?? ""}'. ${hardStop()}`;
+    return `User denied bash command '${result.command ?? ""}'.\n${formatPolicySummary(result)}\n${hardStop()}`;
   }
 
-  return `User denied ${result.toolName} on '${result.path ?? ""}'. ${hardStop()}`;
+  return `User denied ${result.toolName} on '${result.path ?? ""}'.\n${formatPolicySummary(result)}\n${hardStop()}`;
 }
 
-function formatCodemodeMatches(matches: readonly CodemodePermissionRule[]): string {
-  return matches
-    .map((rule) => `- ${JSON.stringify(rule.selector)}: ${rule.state} (${rule.layer} config)`)
-    .join("\n");
+function formatCodemodeMatches(matches: readonly CodemodePermissionRule[], state: PermissionState): string {
+  const rules = matches.map((rule) => {
+    const role = rule.state === state ? "Decisive rule" : "Context rule";
+    return `- ${role}: selector[${JSON.stringify(rule.selector)}] = ${rule.state}`;
+  });
+  return [`Effective codemode policy: ${state}`, ...rules].join("\n");
 }
 
 function escapePreviewControls(code: string): string {
@@ -194,7 +198,7 @@ async function enforceCodemode(
   if (check.state === "deny") {
     return {
       block: true,
-      reason: `Codemode script denied by policy:\n${formatCodemodeMatches(check.matches)}\n${hardStop()}`,
+      reason: `Codemode script denied by policy:\n${formatCodemodeMatches(check.matches, check.state)}\n${hardStop()}`,
     };
   }
 
@@ -205,7 +209,7 @@ async function enforceCodemode(
   if (!ctx.hasUI) {
     return {
       block: true,
-      reason: `Codemode script requires approval, but no interactive UI is available.\n${formatCodemodeMatches(check.matches)}`,
+      reason: `Codemode script requires approval, but no interactive UI is available.\n${unavailableExplanation()}\n${formatCodemodeMatches(check.matches, check.state)}`,
     };
   }
 
@@ -221,8 +225,7 @@ async function enforceCodemode(
 
   const message = [
     "Allow this codemode script?",
-    "Matching rules:",
-    formatCodemodeMatches(check.matches),
+    formatCodemodeMatches(check.matches, check.state),
     formatCodemodePreview(code),
   ].join("\n\n");
   const approved = await ctx.ui.confirm("Codemode Permission Required", message, { signal });
@@ -230,7 +233,10 @@ async function enforceCodemode(
     return CANCELLED_BY_ABORT;
   }
   if (!approved) {
-    return { block: true, reason: `User denied codemode script. ${hardStop()}` };
+    return {
+      block: true,
+      reason: `User denied codemode script.\n${formatCodemodeMatches(check.matches, check.state)}\n${hardStop()}`,
+    };
   }
 
   return {};

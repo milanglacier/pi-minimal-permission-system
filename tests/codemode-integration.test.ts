@@ -17,6 +17,9 @@ import {
 
 import minimalPermissionExtension from "../index.js";
 
+const HARD_STOP = "Hard stop: this permission denial is policy-enforced. Do not retry or investigate bypasses; report the block to the user.";
+const NO_UI_EXPLANATION = "This non-interactive session cannot present the approval request for user review or approval. The operation is blocked.";
+
 type ObservedNestedCall = { toolName: string; parentToolCallId?: string };
 type TestSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
 
@@ -161,21 +164,53 @@ async function withPiCodemodeSession(
 
 await test("the real codemode pipeline blocks a script before its nested write executes", async () => {
   const code = 'await tools.write({ path: "blocked.txt", content: "must not be written" });';
+  const selector = "CallExpression[callee.object.name='tools'][callee.property.name='write']";
   await withPiCodemodeSession({
     code,
-    globalConfig: '{"write":{"**":"allow"}}',
-    projectConfig: JSON.stringify({
-      codemode: {
-        "CallExpression[callee.object.name='tools'][callee.property.name='write']": "deny",
-      },
-    }),
+    globalConfig: '{"write":{"**":"allow"},"codemode":{"Program":"allow"}}',
+    projectConfig: JSON.stringify({ codemode: { [selector]: "deny" } }),
   }, async ({ cwd, nestedCalls, session }) => {
     assert.equal(existsSync(join(cwd, "blocked.txt")), false);
     assert.deepEqual(nestedCalls, []);
-    assert.match(codemodeResultText(session), /Codemode script denied by policy/);
-    assert.match(codemodeResultText(session), /CallExpression.*project config/);
+    const result = codemodeResultText(session);
+    assert.match(result, /Codemode script denied by policy/);
+    assert.match(result, /Effective codemode policy: deny/);
+    assert.ok(result.includes(`- Decisive rule: selector[${JSON.stringify(selector)}] = deny`));
+    assert.ok(result.includes('- Context rule: selector["Program"] = allow'));
+    assert.ok(result.includes(HARD_STOP));
+    assert.doesNotMatch(result, /global config|project config/);
   });
 });
+
+for (const noUI of [false, true]) {
+  await test(`codemode ask ${noUI ? "without a UI" : "rejected by the user"} explains its rules in the model-facing result`, async () => {
+    await withPiCodemodeSession({
+      code: 'await tools.write({ path: "script-ask-blocked.txt", content: "blocked" });',
+      globalConfig: '{"write":{"**":"allow"},"codemode":{"Program":"ask"}}',
+      projectConfig: '{"codemode":{"CallExpression":"allow"}}',
+      approve: noUI ? undefined : async () => false,
+    }, async ({ cwd, session, nestedCalls, approvals }) => {
+      assert.equal(existsSync(join(cwd, "script-ask-blocked.txt")), false);
+      assert.deepEqual(nestedCalls, []);
+      assert.equal(approvals.length, noUI ? 0 : 1);
+      const result = codemodeResultText(session);
+      assert.match(result, /Effective codemode policy: ask/);
+      assert.ok(result.includes('- Decisive rule: selector["Program"] = ask'));
+      assert.ok(result.includes('- Context rule: selector["CallExpression"] = allow'));
+      assert.doesNotMatch(result, /global config|project config/);
+      if (noUI) {
+        assert.match(result, /requires approval, but no interactive UI is available/);
+        assert.ok(result.includes(NO_UI_EXPLANATION));
+        assert.doesNotMatch(result, /User denied|denied by policy/);
+      } else {
+        assert.match(result, /User denied codemode script/);
+        assert.ok(result.includes(HARD_STOP));
+        assert.ok(approvals[0]!.includes('- Decisive rule: selector["Program"] = ask'));
+        assert.doesNotMatch(approvals[0]!, /global config|project config/);
+      }
+    });
+  });
+}
 
 await test("syntax denies prevent direct eval inside dynamic-import options from executing", async () => {
   const marker = "import-options-executed";
@@ -282,35 +317,60 @@ await test("an allowed script still enforces global denies for computed parallel
   });
 });
 
-await test("approving a codemode script does not approve its nested writes", async () => {
-  const code = 'await tools.write({ path: "approved-but-blocked.txt", content: "blocked" });';
-  await withPiCodemodeSession({
-    code,
-    globalConfig: '{"write":{"**":"deny"}}',
-    projectConfig: '{"codemode":{"Program":"ask"}}',
-    approve: async () => true,
-  }, async ({ cwd, nestedCalls, approvals, session }) => {
-    assert.equal(approvals.length, 1);
-    assert.match(approvals[0]!, /Program.*ask.*project config/);
-    assert.equal(nestedCalls.length, 1);
-    assert.equal(nestedCalls[0]!.toolName, "write");
-    assert.ok(nestedCalls[0]!.parentToolCallId);
-    assert.equal(existsSync(join(cwd, "approved-but-blocked.txt")), false);
-    assert.match(codemodeResultText(session), /Permission denied for write/);
-  });
-});
+for (const scenario of [
+  { name: "policy deny", writeState: "deny", noUI: false },
+  { name: "rejected ask", writeState: "ask", noUI: false },
+  { name: "ask without a UI", writeState: "ask", noUI: true },
+  { name: "rejected default ask", writeState: undefined, noUI: false },
+  { name: "default ask without a UI", writeState: undefined, noUI: true },
+]) {
+  for (const scriptState of scenario.noUI ? ["allow"] : ["allow", "ask"]) {
+    await test(`an ${scriptState === "ask" ? "approved" : "allowed"} script reports nested write ${scenario.name} to the model`, async () => {
+      await withPiCodemodeSession({
+        code: 'await tools.write({ path: "nested-blocked.txt", content: "blocked" });',
+        globalConfig: JSON.stringify({
+          ...(scenario.writeState ? { write: { "**": scenario.writeState } } : {}),
+          codemode: { Program: scriptState },
+        }),
+        approve: scenario.noUI ? undefined : async (title) => title === "Codemode Permission Required",
+      }, async ({ cwd, nestedCalls, approvals, session }) => {
+        assert.equal(existsSync(join(cwd, "nested-blocked.txt")), false);
+        assert.equal(nestedCalls.length, 1);
+        assert.equal(nestedCalls[0]!.toolName, "write");
+        assert.ok(nestedCalls[0]!.parentToolCallId);
+        const scriptApprovals = scriptState === "ask" ? 1 : 0;
+        const writeApprovals = scenario.writeState !== "deny" && !scenario.noUI ? 1 : 0;
+        assert.equal(approvals.length, scriptApprovals + writeApprovals);
+        const result = codemodeResultText(session);
+        const policy = scenario.writeState
+          ? `Effective policy: write["**"] = ${scenario.writeState}`
+          : "Effective policy: built-in default ask (no matching rule).";
+        assert.ok(result.includes(policy), result);
+        assert.doesNotMatch(result, /global config|project config/);
+        if (scenario.writeState === "deny") {
+          assert.match(result, /Permission denied for write/);
+          assert.ok(result.includes(HARD_STOP));
+        } else if (scenario.noUI) {
+          assert.match(result, /requires approval, but no interactive UI is available/);
+          assert.ok(result.includes(NO_UI_EXPLANATION));
+          assert.doesNotMatch(result, /User denied|Permission denied/);
+        } else {
+          assert.match(result, /User denied write/);
+          assert.ok(result.includes(HARD_STOP));
+          assert.ok(approvals.at(-1)!.includes(policy));
+        }
+        if (scriptState === "ask") {
+          assert.ok(approvals[0]!.includes('- Decisive rule: selector["Program"] = ask'));
+        }
+        for (const approval of approvals) {
+          assert.doesNotMatch(approval, /global config|project config/);
+        }
+      });
+    });
+  }
+}
 
-await test("nested ask without an interactive UI blocks while permitted nested writes succeed", async () => {
-  await withPiCodemodeSession({
-    code: 'try { await tools.write({ path: "ask-blocked.txt", content: "blocked" }); } catch { text("ask blocked"); }',
-    globalConfig: '{"write":{"**":"ask"}}',
-  }, async ({ cwd, nestedCalls, approvals, session }) => {
-    assert.equal(existsSync(join(cwd, "ask-blocked.txt")), false);
-    assert.equal(nestedCalls.length, 1);
-    assert.deepEqual(approvals, []);
-    assert.match(codemodeResultText(session), /ask blocked/);
-  });
-
+await test("permitted nested writes succeed", async () => {
   await withPiCodemodeSession({
     code: 'await tools.write({ path: "permitted.txt", content: "written" });',
     globalConfig: '{"write":{"**":"allow"}}',
