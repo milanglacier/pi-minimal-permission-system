@@ -194,14 +194,15 @@ paths, then asks again for extra targets or `..`:
     "rm\\s+-[rRf]+\\s+(?!(\"?/tmp/[\\w.-][\\w./-]*\"?|\"?\\$\\{?\\w*(tmp|TMP|temp|TEMP)\\w*\\}?\"?)\\s*([;&|)'\\n]|$))": "ask",
     // Ask ".." targets, even under /tmp.
     "rm\\s+-[rRf]+\\s+.*\\.\\.": "ask",
+    // Allow: xxx=$(mktemp -d); rm -r "$xxx"
+    "^([A-Za-z_]\\w*)=\\$\\(mktemp -d(?: [^()\\n]*)?\\)\\s*(?:;|&&|\\n)\\s*rm -rf? \"\\$(?:\\1|\\{\\1\\})\"\\s*$": "allow",
   },
 }
 ```
 
 `rm -rf /tmp/build`, `rm -f /tmp/x.log`, and `rm -rf "$tmp"` run without
 prompting. `rm -rf ./build`, `rm -rf /tmp/a /tmp/b`, and `rm -rf /tmp/../etc`
-ask for confirmation. These regexes are convenience rules, not a guarantee
-that a command only affects temporary files.
+ask for confirmation. These regexes cannot cover every scenario.
 
 ### Per-project override
 
