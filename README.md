@@ -195,7 +195,7 @@ paths, then asks again for extra targets or `..`:
     // Ask ".." targets, even under /tmp.
     "rm\\s+-[rRf]+\\s+.*\\.\\.": "ask",
     // Allow: xxx=$(mktemp -d); rm -r "$xxx"
-    "^([A-Za-z_]\\w*)=\\$\\(mktemp -d[^)]*\\)[\\s\\S]*rm\\s+(-[rRf]+\\s+)?\"\\$(\\1|\\{\\1\\})\"": "allow",
+    "^([A-Za-z_]\\w*)=\"?\\$\\(mktemp -d[^)]*\\)[\\s\\S]*rm\\s+(-[rRf]+\\s+)?\"\\$(\\1|\\{\\1\\})\"": "allow",
   },
 }
 ```
