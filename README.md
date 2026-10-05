@@ -134,6 +134,12 @@ YOLO bypasses policy loading, rule checks, and approval prompts for all covered
 tools, including codemode. It also bypasses global denials and codemode policy
 validation.
 
+Set `PI_MINIMAL_PERMISSION_SYSTEM_YOLO=1` to enable YOLO by default, or `=0`
+to enforce permissions.
+
+Explicit flags override the environment: `--yolo` enables YOLO, and
+`--no-yolo` disables it. If both flags are supplied, `--no-yolo` wins.
+
 ## Example workflows
 
 ### Read-only mode for sensitive directories

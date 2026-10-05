@@ -20,6 +20,7 @@ import type { CodemodePermissionRule, PermissionCheckResult, PermissionState, Su
 const SUPPORTED_TOOLS = new Set<string>(["bash", "read", "edit", "write"] satisfies SupportedToolName[]);
 const CODEMODE_TOOL_NAME = "codemode";
 const CODEMODE_PREVIEW_LIMIT = 1000;
+const YOLO_ENV_VAR = "PI_MINIMAL_PERMISSION_SYSTEM_YOLO";
 
 // Deliberately not a "denial": the user stopped the turn, they did not refuse the tool.
 const CANCELLED_BY_ABORT: ToolCallEventResult = {
@@ -33,7 +34,6 @@ type RuntimePolicy = CachedPolicy & {
 
 let cachedPolicy: RuntimePolicy | null = null;
 let cachedCwd: string | undefined;
-let yoloEnabled = false;
 
 function isSupportedToolName(toolName: string): toolName is SupportedToolName {
   return SUPPORTED_TOOLS.has(toolName);
@@ -243,24 +243,37 @@ async function enforceCodemode(
 }
 
 export default function minimalPermissionExtension(pi: ExtensionAPI): void {
-  yoloEnabled = false;
+  let yoloEnabled = false;
 
   pi.registerFlag("yolo", {
     description: "Bypass permission checks enforced by pi-minimal-permission-system.",
     type: "boolean",
-    default: false,
+  });
+
+  pi.registerFlag("no-yolo", {
+    description: "Enforce permissions even when YOLO is inherited from the environment.",
+    type: "boolean",
   });
 
   pi.registerCommand("yolo", {
     description: "Toggle permission checks enforced by pi-minimal-permission-system.",
     handler: async (_args, ctx) => {
       yoloEnabled = !yoloEnabled;
+      process.env[YOLO_ENV_VAR] = yoloEnabled ? "1" : "0";
       ctx.ui.notify(`YOLO mode ${yoloEnabled ? "enabled" : "disabled"}`, "info");
     },
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    yoloEnabled = pi.getFlag("yolo") === true;
+    const yoloFlag = pi.getFlag("yolo");
+    if (pi.getFlag("no-yolo") === true) {
+      yoloEnabled = false;
+    } else if (typeof yoloFlag === "boolean") {
+      yoloEnabled = yoloFlag;
+    } else {
+      yoloEnabled = process.env[YOLO_ENV_VAR] === "1";
+    }
+    process.env[YOLO_ENV_VAR] = yoloEnabled ? "1" : "0";
     if (!yoloEnabled) {
       loadPolicy(ctx);
     }

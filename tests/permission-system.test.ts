@@ -88,7 +88,7 @@ type Harness = {
 async function createHarness(
   globalConfig: string | null,
   projectConfig: string | null,
-  options: { yoloFlag?: boolean } = {},
+  options: { yoloFlag?: boolean; noYoloFlag?: boolean; yoloEnv?: string; inheritYoloEnv?: boolean } = {},
 ): Promise<Harness> {
   const baseDir = mkdtempSync(join(tmpdir(), "pi-minimal-permission-system-runtime-"));
   const home = join(baseDir, "home");
@@ -100,6 +100,7 @@ async function createHarness(
   const flagValues = new Map<string, boolean | string>();
   const originalHome = process.env.HOME;
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const originalYoloEnv = process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO;
 
   mkdirSync(home, { recursive: true });
   mkdirSync(cwd, { recursive: true });
@@ -114,8 +115,15 @@ async function createHarness(
 
   process.env.HOME = home;
   delete process.env.PI_CODING_AGENT_DIR;
-  if (options.yoloFlag === true) {
-    flagValues.set("yolo", true);
+  if (!options.inheritYoloEnv) {
+    if (options.yoloEnv === undefined) delete process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO;
+    else process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO = options.yoloEnv;
+  }
+  if (options.yoloFlag !== undefined) {
+    flagValues.set("yolo", options.yoloFlag);
+  }
+  if (options.noYoloFlag !== undefined) {
+    flagValues.set("no-yolo", options.noYoloFlag);
   }
 
   const api = {
@@ -162,6 +170,8 @@ async function createHarness(
       } else {
         process.env.PI_CODING_AGENT_DIR = originalAgentDir;
       }
+      if (originalYoloEnv === undefined) delete process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO;
+      else process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO = originalYoloEnv;
       rmSync(baseDir, { recursive: true, force: true });
     },
   };
@@ -1071,6 +1081,85 @@ for (const mode of ["--yolo", "/yolo"]) {
       assert.equal(harness.prompts.length, 0);
     } finally {
       await cleanupPendingConfirmation(harness, dialog, pending);
+    }
+  });
+}
+
+for (const yoloEnv of [undefined, "0", "1", "", "false", "true", " 1 "]) {
+  for (const scenario of [
+    { name: "no flags", flags: {}, enabled: yoloEnv === "1" },
+    { name: "--yolo", flags: { yoloFlag: true }, enabled: true },
+    { name: "--no-yolo", flags: { noYoloFlag: true }, enabled: false },
+    { name: "both flags", flags: { yoloFlag: true, noYoloFlag: true }, enabled: false },
+    { name: "explicit false yolo", flags: { yoloFlag: false }, enabled: false },
+    { name: "false no-yolo", flags: { noYoloFlag: false }, enabled: yoloEnv === "1" },
+  ]) {
+    await runTest(`${scenario.name} with YOLO environment ${JSON.stringify(yoloEnv)} ${scenario.enabled ? "bypasses" : "enforces"} permissions`, async () => {
+      const harness = await createHarness(JSON.stringify({
+        bash: { ".*": "deny" },
+        read: { "**": "deny" },
+        edit: { "**": "deny" },
+        write: { "**": "deny" },
+        codemode: { DebuggerStatement: "invalid" },
+      }), null, { ...scenario.flags, yoloEnv });
+      try {
+        assert.equal(process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO, scenario.enabled ? "1" : "0");
+        for (const event of [...askToolCalls, { toolName: "codemode" as const, input: { code: "debugger;" } }]) {
+          const result = await runToolCall(harness, event);
+          if (scenario.enabled) assert.deepEqual(result, {});
+          else assert.equal(result.block, true);
+        }
+        assert.equal(harness.prompts.length, 0);
+      } finally {
+        harness.cleanup();
+      }
+    });
+  }
+}
+
+await runTest("starting an explicitly normal child cannot disable its running YOLO parent", async () => {
+  const sessions: Harness[] = [];
+  const policy = '{"bash":{".*":"deny"}}';
+  try {
+    const parent = await createHarness(null, policy, { yoloFlag: true });
+    sessions.push(parent);
+    const child = await createHarness(null, policy, { noYoloFlag: true, inheritYoloEnv: true });
+    sessions.push(child);
+    assert.equal((await runToolCall(child, askToolCalls[0]!)).block, true);
+    assert.deepEqual(await runToolCall(parent, askToolCalls[0]!), {});
+    assert.equal(process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO, "0");
+    const laterChild = await createHarness(null, policy, { inheritYoloEnv: true });
+    sessions.push(laterChild);
+    assert.equal((await runToolCall(laterChild, askToolCalls[0]!)).block, true);
+    assert.deepEqual(await runToolCall(parent, askToolCalls[0]!), {});
+  } finally {
+    for (const session of sessions.reverse()) session.cleanup();
+  }
+});
+
+for (const initiallyEnabled of [true, false]) {
+  await runTest(`turning parent YOLO ${initiallyEnabled ? "off" : "on"} changes future children but not an already-running child`, async () => {
+    const sessions: Harness[] = [];
+    const policy = '{"bash":{".*":"deny"}}';
+    try {
+      const parent = await createHarness(null, policy, { yoloFlag: initiallyEnabled });
+      sessions.push(parent);
+      assert.equal(process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO, initiallyEnabled ? "1" : "0");
+      const child = await createHarness(null, policy, { inheritYoloEnv: true });
+      sessions.push(child);
+      assert.equal((await runToolCall(child, askToolCalls[0]!)).block === true, !initiallyEnabled);
+      assert.equal((await runToolCall(parent, askToolCalls[0]!)).block === true, !initiallyEnabled);
+
+      await runSlashCommand(parent, "yolo");
+      assert.equal(process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO, initiallyEnabled ? "0" : "1");
+      assert.equal((await runToolCall(parent, askToolCalls[0]!)).block === true, initiallyEnabled);
+      assert.equal((await runToolCall(child, askToolCalls[0]!)).block === true, !initiallyEnabled);
+      const laterChild = await createHarness(null, policy, { inheritYoloEnv: true });
+      sessions.push(laterChild);
+      assert.equal((await runToolCall(laterChild, askToolCalls[0]!)).block === true, initiallyEnabled);
+      assert.equal((await runToolCall(child, askToolCalls[0]!)).block === true, !initiallyEnabled);
+    } finally {
+      for (const session of sessions.reverse()) session.cleanup();
     }
   });
 }

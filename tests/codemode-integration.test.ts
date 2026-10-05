@@ -81,6 +81,7 @@ async function withPiCodemodeSession(
   const cwd = join(root, "project");
   const originalHome = process.env.HOME;
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const originalYolo = process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO;
   const nestedCalls: ObservedNestedCall[] = [];
   const approvals: string[] = [];
   let session: TestSession | undefined;
@@ -94,6 +95,7 @@ async function withPiCodemodeSession(
   }
   process.env.HOME = root;
   process.env.PI_CODING_AGENT_DIR = agentDir;
+  delete process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO;
 
   try {
     const faux = fauxProvider({ provider: "pi-codemode-test" });
@@ -158,6 +160,8 @@ async function withPiCodemodeSession(
     else process.env.HOME = originalHome;
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    if (originalYolo === undefined) delete process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO;
+    else process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO = originalYolo;
     rmSync(root, { recursive: true, force: true });
   }
 }

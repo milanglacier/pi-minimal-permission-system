@@ -26,7 +26,7 @@
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx ./tests/permission-system.test.ts && tsx ./tests/codemode.test.ts && tsx ./tests/codemode-integration.test.ts",
+    "test": "tsx ./tests/permission-system.test.ts && tsx ./tests/codemode.test.ts && tsx ./tests/codemode-integration.test.ts && tsx ./tests/yolo-integration.test.ts",
     "check": "npm run typecheck && npm run test"
   },
   "keywords": [
