@@ -178,8 +178,9 @@ Explicit flags override the environment: `--yolo` enables YOLO, and
 ### Allow `rm -r`/`rm -f` in temp paths, ask elsewhere
 
 Bash rules inspect the command string, not the shell's parsed arguments or
-expanded variables. This example asks about `rm` flags, allows matching temp
-paths, then asks again for extra targets or `..`:
+expanded variables. The following config demonstrates how to restrict
+destructive `rm` commands globally while permitting them within designated
+temporary directories.
 
 ```jsonc
 {
@@ -195,14 +196,19 @@ paths, then asks again for extra targets or `..`:
     // Ask ".." targets, even under /tmp.
     "rm\\s+-[rRf]+\\s+.*\\.\\.": "ask",
     // Allow: xxx=$(mktemp -d); rm -r "$xxx"
-    "^([A-Za-z_]\\w*)=\"?\\$\\(mktemp -d[^)]*\\)[\\s\\S]*rm\\s+(-[rRf]+\\s+)?\"\\$(\\1|\\{\\1\\})\"": "allow",
+    "([A-Za-z_]\\w*)=\"?\\$\\(mktemp -d[^)]*\\)[\\s\\S]*rm\\s+(-[rRf]+\\s+)?\"\\$(\\1|\\{\\1\\})\"": "allow",
   },
 }
 ```
 
-`rm -rf /tmp/build`, `rm -f /tmp/x.log`, and `rm -rf "$tmp"` run without
-prompting. `rm -rf ./build`, `rm -rf /tmp/a /tmp/b`, and `rm -rf /tmp/../etc`
-ask for confirmation. These regexes cannot cover every scenario.
+Under this config, commands like `rm -rf /tmp/build`, `rm -f /tmp/x.log`, and
+`rm -rf "$tmp"` execute without prompting the user. Conversely, commands that
+pose a hig her risk—such as `rm -rf ./build`, multi-target deletions like `rm
+-rf /tmp/a /tmp/b`, or directory-traversal attempts like `rm -rf
+/tmp/../etc`—trigger a confirmation prompt. It also allows `rm` on temporary
+directories generated via `mktemp -d` by detecting the variable name, so
+standard cleanup scripts proceed uninterrupted. These regular expressions cover
+common patterns but are heuristic and may not capture every edge case.
 
 ### Per-project override
 
