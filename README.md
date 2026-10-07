@@ -49,6 +49,11 @@ Define permissions in JSONC files (JSON with comments). Use `allow` to permit a
 call, `deny` to block it, or `ask` to request approval. Calls that require
 approval are blocked when no interactive UI is available.
 
+If you run Pi in a mode with no one to answer prompts, such as `--mode rpc`
+without a UI client, set `PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE=1`.
+Calls that require approval are then blocked as if no UI were available,
+instead of showing a prompt that nobody can answer.
+
 ### Global config
 
 `~/.pi/agent/permissions.jsonc`

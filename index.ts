@@ -21,6 +21,8 @@ const SUPPORTED_TOOLS = new Set<string>(["bash", "read", "edit", "write"] satisf
 const CODEMODE_TOOL_NAME = "codemode";
 const CODEMODE_PREVIEW_LIMIT = 1000;
 const YOLO_ENV_VAR = "PI_MINIMAL_PERMISSION_SYSTEM_YOLO";
+// Set by hosts that run Pi without a person, such as an RPC host that cancels every dialog.
+const NONINTERACTIVE_ENV_VAR = "PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE";
 
 // Deliberately not a "denial": the user stopped the turn, they did not refuse the tool.
 const CANCELLED_BY_ABORT: ToolCallEventResult = {
@@ -189,6 +191,7 @@ async function enforceCodemode(
   event: ToolCallEvent,
   ctx: ExtensionContext,
   policy: RuntimePolicy,
+  canRequestApproval: boolean,
 ): Promise<ToolCallEventResult> {
   const check = checkCodemodeScript(event.input, policy.codemodeRules, policy.codemodeDiagnostics);
   if (check.kind === "block") {
@@ -206,7 +209,7 @@ async function enforceCodemode(
     return {};
   }
 
-  if (!ctx.hasUI) {
+  if (!canRequestApproval) {
     return {
       block: true,
       reason: `Codemode script requires approval, but no interactive UI is available.\n${unavailableExplanation()}\n${formatCodemodeMatches(check.matches, check.state)}`,
@@ -244,6 +247,9 @@ async function enforceCodemode(
 
 export default function minimalPermissionExtension(pi: ExtensionAPI): void {
   let yoloEnabled = false;
+  let noninteractive = false;
+
+  const canRequestApproval = (ctx: ExtensionContext): boolean => ctx.hasUI && !noninteractive;
 
   pi.registerFlag("yolo", {
     description: "Bypass permission checks enforced by pi-minimal-permission-system.",
@@ -274,6 +280,7 @@ export default function minimalPermissionExtension(pi: ExtensionAPI): void {
       yoloEnabled = process.env[YOLO_ENV_VAR] === "1";
     }
     process.env[YOLO_ENV_VAR] = yoloEnabled ? "1" : "0";
+    noninteractive = process.env[NONINTERACTIVE_ENV_VAR] === "1";
     if (!yoloEnabled) {
       loadPolicy(ctx);
     }
@@ -290,7 +297,7 @@ export default function minimalPermissionExtension(pi: ExtensionAPI): void {
 
     const policy = loadPolicy(ctx);
     if (event.toolName === CODEMODE_TOOL_NAME) {
-      return enforceCodemode(event, ctx, policy);
+      return enforceCodemode(event, ctx, policy, canRequestApproval(ctx));
     }
 
     if (!isSupportedToolName(event.toolName)) {
@@ -309,7 +316,7 @@ export default function minimalPermissionExtension(pi: ExtensionAPI): void {
     }
 
     if (result.state === "ask") {
-      if (!ctx.hasUI) {
+      if (!canRequestApproval(ctx)) {
         return { block: true, reason: formatUnavailableReason(result) };
       }
 

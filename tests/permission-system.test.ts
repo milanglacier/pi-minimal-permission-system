@@ -88,7 +88,9 @@ type Harness = {
 async function createHarness(
   globalConfig: string | null,
   projectConfig: string | null,
-  options: { yoloFlag?: boolean; noYoloFlag?: boolean; yoloEnv?: string; inheritYoloEnv?: boolean } = {},
+  options: {
+    yoloFlag?: boolean; noYoloFlag?: boolean; yoloEnv?: string; inheritYoloEnv?: boolean; noninteractiveEnv?: string;
+  } = {},
 ): Promise<Harness> {
   const baseDir = mkdtempSync(join(tmpdir(), "pi-minimal-permission-system-runtime-"));
   const home = join(baseDir, "home");
@@ -101,6 +103,7 @@ async function createHarness(
   const originalHome = process.env.HOME;
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   const originalYoloEnv = process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO;
+  const originalNoninteractiveEnv = process.env.PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE;
 
   mkdirSync(home, { recursive: true });
   mkdirSync(cwd, { recursive: true });
@@ -119,6 +122,8 @@ async function createHarness(
     if (options.yoloEnv === undefined) delete process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO;
     else process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO = options.yoloEnv;
   }
+  if (options.noninteractiveEnv === undefined) delete process.env.PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE;
+  else process.env.PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE = options.noninteractiveEnv;
   if (options.yoloFlag !== undefined) {
     flagValues.set("yolo", options.yoloFlag);
   }
@@ -172,6 +177,8 @@ async function createHarness(
       }
       if (originalYoloEnv === undefined) delete process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO;
       else process.env.PI_MINIMAL_PERMISSION_SYSTEM_YOLO = originalYoloEnv;
+      if (originalNoninteractiveEnv === undefined) delete process.env.PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE;
+      else process.env.PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE = originalNoninteractiveEnv;
       rmSync(baseDir, { recursive: true, force: true });
     },
   };
@@ -885,6 +892,140 @@ await runTest("codemode ask fails closed when no interactive UI is available", a
     harness.cleanup();
   }
 });
+
+function confirmMustNotOpen(): Confirm {
+  return async () => {
+    throw new Error("Approval dialog must not open");
+  };
+}
+
+for (const event of askToolCalls) {
+  await runTest(`${event.toolName} ask is blocked without a dialog when the host marks the session non-interactive`, async () => {
+    const pattern = event.toolName === "bash" ? ".*" : "*";
+    const harness = await createHarness(
+      JSON.stringify({ [event.toolName]: { [pattern]: "ask" } }),
+      null,
+      { noninteractiveEnv: "1" },
+    );
+    try {
+      const result = await runToolCall(harness, event, { hasUI: true, confirm: confirmMustNotOpen() });
+      const reason = String(result.reason);
+      assert.equal(result.block, true);
+      assert.match(reason, /requires approval, but no interactive UI is available/);
+      assert.match(reason, /non-interactive session cannot present the approval request/);
+      assert.ok(reason.includes(`Effective policy: ${event.toolName}[${JSON.stringify(pattern)}] = ask`));
+      assert.doesNotMatch(reason, /User denied|denied by policy|Hard stop/);
+      assert.equal(harness.prompts.length, 0);
+    } finally {
+      harness.cleanup();
+    }
+  });
+}
+
+await runTest("codemode ask is blocked without a dialog when the host marks the session non-interactive", async () => {
+  const harness = await createHarness('{"codemode":{"Program":"ask"}}', null, { noninteractiveEnv: "1" });
+  try {
+    const result = await runToolCall(
+      harness,
+      { toolName: "codemode", input: { code: "return 1;" } },
+      { hasUI: true, confirm: confirmMustNotOpen() },
+    );
+    const reason = String(result.reason);
+    assert.equal(result.block, true);
+    assert.match(reason, /Codemode script requires approval, but no interactive UI is available/);
+    assert.match(reason, /non-interactive session cannot present the approval request/);
+    assert.ok(reason.includes('- Decisive rule: selector["Program"] = ask'));
+    assert.doesNotMatch(reason, /User denied|denied by policy|Hard stop/);
+    assert.equal(harness.prompts.length, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+for (const noninteractiveEnv of [undefined, "0", "true", "", " 1 "]) {
+  await runTest(`non-interactive environment ${JSON.stringify(noninteractiveEnv)} still opens approval dialogs`, async () => {
+    const harness = await createHarness(
+      '{"bash":{".*":"ask"},"codemode":{"Program":"ask"}}',
+      null,
+      { noninteractiveEnv },
+    );
+    try {
+      assert.deepEqual(await runToolCall(harness, askToolCalls[0]!, { hasUI: true, confirm: async () => true }), {});
+      assert.deepEqual(await runToolCall(
+        harness,
+        { toolName: "codemode", input: { code: "return 1;" } },
+        { hasUI: true, confirm: async () => true },
+      ), {});
+      assert.equal(harness.prompts.length, 2);
+      assert.equal(process.env.PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE, noninteractiveEnv);
+    } finally {
+      harness.cleanup();
+    }
+  });
+}
+
+await runTest("non-interactive sessions keep allow and deny decisions unchanged", async () => {
+  const harness = await createHarness(
+    '{"bash":{"git status":"allow","rm -rf .*":"deny"},"codemode":{"DebuggerStatement":"deny"}}',
+    null,
+    { noninteractiveEnv: "1" },
+  );
+  try {
+    const options = { hasUI: true, confirm: confirmMustNotOpen() };
+    assert.deepEqual(await runToolCall(harness, { toolName: "bash", input: { command: "git status" } }, options), {});
+    assert.deepEqual(await runToolCall(harness, { toolName: "codemode", input: { code: "return 1;" } }, options), {});
+
+    const denied = await runToolCall(harness, { toolName: "bash", input: { command: "rm -rf build" } }, options);
+    assert.equal(denied.block, true);
+    assert.match(String(denied.reason), /Permission denied for bash command 'rm -rf build' by policy/);
+    assert.match(String(denied.reason), /Hard stop/);
+
+    const deniedScript = await runToolCall(harness, { toolName: "codemode", input: { code: "debugger;" } }, options);
+    assert.equal(deniedScript.block, true);
+    assert.match(String(deniedScript.reason), /Codemode script denied by policy/);
+    assert.equal(harness.prompts.length, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+await runTest("YOLO bypasses ask rules in a non-interactive session", async () => {
+  const harness = await createHarness(
+    '{"bash":{".*":"ask"},"codemode":{"Program":"ask"}}',
+    null,
+    { yoloFlag: true, noninteractiveEnv: "1" },
+  );
+  try {
+    const options = { hasUI: true, confirm: confirmMustNotOpen() };
+    assert.deepEqual(await runToolCall(harness, askToolCalls[0]!, options), {});
+    assert.deepEqual(await runToolCall(harness, { toolName: "codemode", input: { code: "return 1;" } }, options), {});
+    assert.equal(harness.prompts.length, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+for (const initial of [undefined, "1"]) {
+  await runTest(`a running session keeps the non-interactive setting it read at startup (${JSON.stringify(initial)})`, async () => {
+    const harness = await createHarness('{"bash":{".*":"ask"}}', null, { noninteractiveEnv: initial });
+    try {
+      if (initial === undefined) process.env.PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE = "1";
+      else delete process.env.PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE;
+
+      const result = await runToolCall(harness, askToolCalls[0]!, { hasUI: true, confirm: async () => true });
+      if (initial === undefined) {
+        assert.deepEqual(result, {});
+        assert.equal(harness.prompts.length, 1);
+      } else {
+        assert.equal(result.block, true);
+        assert.match(String(result.reason), /no interactive UI is available/);
+        assert.equal(harness.prompts.length, 0);
+      }
+    } finally {
+      harness.cleanup();
+    }
+  });
+}
 
 for (const state of ["ask", "deny"] as const) {
   await runTest(`codemode ${state} distinguishes decisive matches from context across layers`, async () => {
